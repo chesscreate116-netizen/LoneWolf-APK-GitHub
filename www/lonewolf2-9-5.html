@@ -1,0 +1,1302 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>LoneWolf 2: Silent Archery</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}#rot{display:none;position:fixed;inset:0;z-index:9;background:#000;color:#e8e2cf;font:700 24px system-ui,sans-serif;flex-direction:column;align-items:center;justify-content:center;text-align:center}canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none}</style>
+</head><body><canvas id="c"></canvas><div id="rot"><div style="font-size:72px;line-height:1">&#8635;</div><div style="margin-top:14px">ROTATE YOUR PHONE</div><div style="margin-top:8px;font-size:15px;font-weight:500;opacity:.7">LoneWolf plays in landscape (16:9)</div></div><script>
+'use strict';
+// ===== CONFIG (metres / seconds / radians unless noted) =====
+const Config={W:1280,H:720,step:1/120,timeScale:1,
+ fov0:40,fovAimRatio:1.3,near:.1,haze:110,                    // vertical FOV (deg), max FOV narrowing at full draw (focus effect only, NOT a scope), haze e-fold distance (m)
+ drawTime:.9,steadyTime:1.5,minDraw:.2,
+ breath:{settle:.55,peak:1.45,holdEnd:2.7,fatLen:3.2,maxSway:9,minSway:.7,fatSway:13},breathAudio:true,   // breath cycle (s since draw start, sway in mrad): inhale -> settle -> STILL WINDOW (peak..holdEnd) -> fatigue ramp
+
+ Fpk:560,Ldraw:.72,pExp:1.4,eta:.85,mEff:.032,mArrow:.025,      // bow energy model: F(u)=Fpk*u^p, E=Fpk*L*u^(p+1)/(p+1), v=sqrt(2*eta*E/mEff)
+ g:9.81,gravityScale:0,dragK:9e-4,windGameScale:10,gustAmount:0,                // quadratic drag k=.5*rho*Cd*A/m ; wind exaggeration (gameplay)
+ nockX:.19,nockY:-.07,nockZ:.55,zeroDist:35,arrowLen:.75,eyeH:1.6,
+ swayDraw:14,swayAnchor:1.1,swayFatigue:12,                      // angular sway in milliradians
+ sensDeg:.065,accel:.18,inputOmega:32,zoomOmega:9,killCam:false,                // inputOmega: smoothing of the raw pointer (the VIEW is the aim; there is no separate lagging camera)
+ handed:'right',sightTier:0,missPolicy:'strict',cancelY:.9,markers:true,
+ autoRange:true,minRange:4,maxRange:124,pinColor:'#4dff7a',sightR:119,faceString:true,   // recurve sight: range-adjusted pin (autoRange) / fixed pin at zeroDist, ring radius px
+ vmLimbFlex:36,stringHz:15,stringDecay:19,rigOmega:25,breathLift:2.5,cameraKick:1.6,
+ nightVisionScale:.8,hearingScale:1,aiHz:20,closeR:8,closeMul:1.5,edgeFrac:.8,edgeMul:.6,drain:1.5,witnessWindow:1,witnessMeter:.5,killY:1.1,bodyY:.3,trunkR:.32,   // AI: vision/hearing scales, tick rate, close/edge notice multipliers, meter drain time (s), witness window (s) + start meter, LOS heights (m), trunk radius
+ patrolSpeed:1.1,turnRate:120,scanDeg:35,scanPeriod:6,sweepDeg:40,sweepPeriod:4,alarmTime:.5,noiseGround:14,noiseTree:18,noiseClank:20,        // patrol m/s, turn deg/s, idle scan +-deg / period s, waypoint look-sweep +-deg / period s, ALARM state s, noise radii m (armor clank 20)
+ visionDef:{range:26,fovDeg:70,noticeTime:.6,eyeH:1.65},hearingDef:{radius:1}};
+const W=Config.W,H=Config.H,{sin,cos,tan,atan,atan2,hypot,PI,sqrt,exp,min,max,abs}=Math,D2R=PI/180;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v,lerp=(a,b,t)=>a+(b-a)*t,sstep=t=>(t=clamp(t,0,1))*t*(3-2*t),rand=Math.random;
+const Game={time:0,hit:false,endT:0,slow:1,alpha:0,failReason:'',fail:null,lastLand:null};   // fail = structured fail record (cause/why/guard/t/warn/noise kind); failReason stays the UI string
+const AIB={nv:Config.nightVisionScale,hs:Config.hearingScale,ps:Config.patrolSpeed},nz=(v,d)=>v===undefined?d:v;      // AI base values: a level's `ai` overrides are applied on top of these at Level.load
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const View={scale:1,ox:0,oy:0,dpr:1},PM={open:0,portrait:0};
+function syncRot(){const el=document.getElementById("rot");PM.portrait=innerHeight>innerWidth*1.05?1:0;if(el)el.style.display=PM.portrait?"flex":"none"}
+function resize(){syncRot();const d=View.dpr=min(devicePixelRatio||1,3),cw=innerWidth,ch=innerHeight;cv.width=cw*d;cv.height=ch*d;View.scale=min(cw/W,ch/H);View.ox=(cw-W*View.scale)/2;View.oy=(ch-H*View.scale)/2}
+addEventListener('resize',resize);resize();
+addEventListener('contextmenu',e=>e.preventDefault());addEventListener('selectstart',e=>e.preventDefault());
+const Assets={fns:{},draw(k,c,x,y,o){c.save();c.translate(x,y);this.fns[k](c,o||{});c.restore()}};
+
+// ===== WORLD (metres): terrain heightfield, road, level data =====
+const roadX=z=>-2+3*sin(z*.05);
+let FLAT=0;      // level flag `flat`: dead-flat ground (TEST-2 camp: the plate is a flat dirt field)
+const T=(x,z)=>{if(FLAT)return 0;const s=sstep(z/25);return s*(1.0*sin(z*.05+4.2)+.5*sin(x*.07-z*.03+1)-.004*z)};   // flat under the player, gentle rolling hills beyond (keeps sight lines to the targets)
+const EYE={x:0,y:Config.eyeH,z:0};
+const LEVELS=[{name:'HIGHLAND RANGE 01',windSpeed:2.4,windHead:1.28,gust:0,
+ ai:{visionRangeScale:.9,fovScale:1,noticeTime:.9,hearingScale:.85,patrolSpeedScale:1,nightVisionScale:.8,missPolicy:'noise',minWarn:1.2,noiseWarn:2},   // early level = forgiving: slower notice, shorter sight, 'noise' policy. Later levels raise these (strict)
+ enemies:[                                                                                       // angles in DEGREES (0 = +z, +90 = +x). x,z metres from the archer at the origin
+  {x:-10,z:20,yaw:90,type:'guard',target:true,route:[{x:-10,z:20,wait:3,look:0},{x:9,z:20,wait:3,look:0}]},
+  {x:2,z:13,yaw:0,type:'guard',target:true,route:[{x:2,z:13,wait:2,look:180},{x:2,z:30,wait:2,look:0}]},
+  {x:15,z:33,yaw:-150,type:'lookout',target:false,route:[],vision:{range:34,fovDeg:60,noticeTime:2.4}},
+  {x:-18,z:34,yaw:-90,type:'guard',target:false,route:[],armor:{deflect:['torso','legs'],weak:['head']}}],     // armored officer: arrows deflect off torso/legs (clank), only a head shot kills
+ cover:[['wall',-6.5,21,.5,10,2.2],['bush',7.5,22,.9,1.5],['rock',9,31.4,.7,1.6],['bush',-1,25,.8,1.4]],
+ trees:[[-14,30,9,0],[-7,38,11,0],[10,24,10,1],[16,40,12,1],[-20,52,10,1],[26,52,11,0],[-4,64,12,1],[34,68,11,1],[-26,34,12,1],[6,70,13,1],[-12,17,8,0],[18,15,9,1],[-30,60,12,0],[40,45,12,1]]}];
+const TEST_LEVELS=[
+ {name:'TEST-LEVEL_1: BREATHING GUARD',windSpeed:0,windHead:0,gust:0,hold:2.7,facing:[90],plate:'t1',fg:'t1',aimYaw:[-.26,.30],fx:1,killcam:1,card:['TEST-LEVEL 1','THE BREATHING GUARD','one guard, standing - look at the art, then take the shot'],   // one breathing guard, faces left/right on alternate loads; no wind; AI cannot alarm (tests ART, not stealth)
+  ai:{visionRangeScale:0,fovScale:1,noticeTime:.9,hearingScale:0,patrolSpeedScale:1,nightVisionScale:1,missPolicy:'forgiving'},
+  enemies:[{x:.35,z:8.6,yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[]}],cover:[],trees:[]},   // guard breathes in the middle of the dirt path (clear of the tent's guy-rope and the tree), facing RIGHT (toward the tent door); plate + foliage = assets/test1_bg.jpg + test1_foliage.png
+
+ // TEST-LEVEL_2: MILITARY CAMP (replaces THE PATROL). Plate 'camp' (flat dirt field), props are cover entries with a 6th field {t:'tent'|'tower'|'drum'|'crate',sol:1} (PROP table): drawn depth-sorted with the enemies, sol = arrows stop on it.
+ // Enemy A walks out of the nearest tent (pv:0 = cover index, hv:'tent'): 5 s inside the door, walks 4.6 m out, 5 s there, walks back. Enemy B (hv:'tower') stands on the watchtower deck behind the wall and looks left / right.
+ {name:'TEST-LEVEL_2: MILITARY CAMP',windSpeed:0,windHead:0,gust:0,hold:2.7,flat:1,plate:'camp',view:{s0:H/839*1.2,pcx:866,pcy:405},aimYaw:[-.48,.38],aimPitch:[-.14,.16],fx:1,killcam:1,card:['TEST-LEVEL 2','MILITARY CAMP','one soldier steps out of a tent - a sentry watches from the tower - a second walker follows'],
+  ai:{visionRangeScale:1,fovScale:.8,noticeTime:1.1,hearingScale:0,patrolSpeedScale:1.1,nightVisionScale:1,missPolicy:'forgiving',minWarn:1.2},
+  enemies:[{x:-6.1,y:.07,z:14.95,fy:1,pv:0,hv:'tent',yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[{x:-6.1,z:14.95,wait:4},{x:2.062,z:14.95,wait:5}]},
+           {x:10.24,y:2.66,z:33.25,pv:3,hv:'tower',yaw:180,type:'guard',target:true,skin:'soldier',look:true,scanDeg:0,vision:{range:60,fovDeg:450,noticeTime:1.1}},      // tower sentry: strict sight over the whole map (every death / body in LOS; only the tent hides it)
+           {x:-3.4,z:30.8,spawn:{after:0,delay:7,alt:[{after:1,delay:3}]},yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,vision:{range:60,fovDeg:100,noticeTime:1.1},route:[{x:-3.4,z:30.8,wait:1},{x:4.4,z:30.8,wait:3,look:70},{x:4.4,z:30.8,wait:1.5,look:-90}]}],      // enemy C: appears 7 s after A dies, walks behind the 3rd tent (hidden by it), shows past its right edge; strict sight on the tower sentry
+  cover:[['wall',-4.0,15,7,.2,3.8,{t:'tent',sol:1}],['wall',-3.1,22,7,.2,3.8,{t:'tent',sol:1}],['wall',-2.2,29,7,.2,3.8,{t:'tent',sol:1}],
+         ['wall',9.5,33,.3,.3,.3,{t:'tower'}],
+         ['wall',2.4,19,3.1,.5,.9,{t:'crate',sol:1,m:1}],['wall',12,27,3.1,.5,.9,{t:'crate',sol:1}],
+         ['wall',-.2,10,.5,.4,.9,{t:'drum',sol:1}],['wall',.45,10.6,.5,.4,.9,{t:'drum',sol:1}],['wall',-.85,10.7,.5,.4,.9,{t:'drum',sol:1}],['wall',6.5,31,.5,.4,.9,{t:'drum',sol:1}],['wall',7.15,31.6,.5,.4,.9,{t:'drum',sol:1}]],
+  trees:[]},
+ // TEST-LEVEL_3: a sentry faces the archer and does the look-around pass (his cone follows his eyes); a second guard patrols in front of him. Kill the watcher first, or shoot when the patrol is out of his sight.
+ // Seeing a kill / a body starts a meter (at least 1.2 s of warning) - he faces what he noticed (NOTICE), then raises the alarm. Light breeze.
+ {name:'TEST-LEVEL_3: THE WATCHER',windSpeed:1,windHead:1.2,gust:0,hold:2.7,fx:1,killcam:1,card:['TEST-LEVEL 3','THE WATCHER','one sentry looks around - one guard walks in front of him'],
+  ai:{visionRangeScale:1,fovScale:.8,noticeTime:1.1,hearingScale:0,patrolSpeedScale:1.1,nightVisionScale:1,missPolicy:'forgiving',minWarn:1.2},
+  enemies:[{x:7,z:25,yaw:180,type:'guard',target:true,skin:'soldier',look:true,scanDeg:0,vision:{range:30,fovDeg:64,noticeTime:1.1}},
+           {x:-5,z:15,yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[{x:-5,z:15,wait:3},{x:3,z:15,wait:3}]}],
+  cover:[],trees:[]},
+ // TEST-LEVEL_4: long range (about 30 m), a steady wind with gusts, depth haze on the sprites, slow-mo kill cam. A far patrol and a far sentry. Read the wind flag, lead the shot.
+ {name:'TEST-LEVEL_4: LONG RANGE',windSpeed:5,windHead:1.4,gust:3,hold:3,fx:1,killcam:1,card:['TEST-LEVEL 4','LONG RANGE','30 m - strong crosswind with gusts - lead the shot, hold your breath'],
+  ai:{visionRangeScale:1,fovScale:.8,noticeTime:1.3,hearingScale:0,patrolSpeedScale:1,nightVisionScale:1,missPolicy:'forgiving',minWarn:1.4},
+  enemies:[{x:8,z:32,yaw:180,type:'guard',target:true,skin:'soldier',look:true,scanDeg:0,vision:{range:36,fovDeg:64,noticeTime:1.3}},
+           {x:-4,z:29,yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[{x:-4,z:29,wait:3},{x:5,z:29,wait:3}]}],
+  cover:[],trees:[]},
+ // TEST-LEVEL_5: INKATERRA CANOPY. Phase 1 = scene only (plate 'ink' = cleaned background, ink:1 = Hut + Walk layers). The guard / the interior soldier arrive in Phases 2-3.
+ {name:'TEST-LEVEL_5: INKATERRA CANOPY',windSpeed:0,windHead:0,gust:0,hold:2.7,plate:'ink',ink:1,view:{s0:H/940*1.2,pcx:750,pcy:520},aimYaw:[-.04,.23],aimPitch:[-.02,.15],fx:1,killcam:1,card:['TEST-LEVEL 5','INKATERRA CANOPY','a tree house above the river - one guard outside, one inside'],
+  ai:{visionRangeScale:0,fovScale:1,noticeTime:.9,hearingScale:0,patrolSpeedScale:1,nightVisionScale:1,missPolicy:'forgiving'},
+  enemies:[{x:6.300,y:4.180,z:29.125,glue:1,hg:[.35,.03],slide:-37,yaw:-90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[]},
+   {x:.29,y:4.18,z:29.5,inn:1,hg:[.5,.34],yaw:90,type:'guard',target:true,skin:'soldier',scanDeg:0,route:[{x:.29,z:29.5,wait:1.5,look:180},{x:2.04,z:29.5,wait:1,look:180},{x:3.71,z:29.5,wait:1.5,look:180},{x:2.04,z:29.5,wait:1,look:180}]}],   // PHASE 3: interior soldier. x/z are SIM metres (door centre = Ink.ix 2.04, depth Ink.gz): left window -> door -> right window -> door; drawn ONLY by Hut.interior (clipped), never by drawEnemy   // PHASE 2: exterior guard on the hut deck (right of the red barrels), faces LEFT toward the walkway; y = deck height (own override, see Level.enemy)
+  cover:[],trees:[]}];
+const Level={cur:null,last:-1,ai:null,
+ enemy(q,n){const x=q.x,z=q.z,yw=(q.yaw||0)*D2R,r=q.route||[],A=this.ai||{},v=Object.assign({},Config.visionDef,A.noticeTime!==undefined?{noticeTime:A.noticeTime}:null,q.vision);       // level data angles are DEGREES; runtime yaw is radians (0 = +z, + toward +x)
+  v.range*=nz(A.visionRangeScale,1);v.fovDeg*=nz(A.fovScale,1);                                                                  // level `ai` overrides: scales multiply; noticeTime is the default for enemies that don't set their own
+  return{x,z,y:q.y!=null?q.y:T(x,z),fy:q.y!=null,gl:!!q.glue,gt:q.hg||null,dd:q.slide||0,inn:!!q.inn,dorm:q.spawn?1:0,sp:q.spawn||null,pvi:q.pv!=null?q.pv:-1,hvk:q.hv||'',pv:null,ux:x,uz:z,upx:x,upz:z,yaw:yw,type:q.type||'guard',target:q.target!==false,skin:q.skin||'',scanDeg:q.scanDeg,look:!!q.look,sweepDeg:q.sweepDeg,turnRate:q.turnRate||(q.skin==='soldier'?Foe.turn:0),route:r,vision:v,hearing:Object.assign({},Config.hearingDef,q.hearing),
+   armor:Object.assign({deflect:[],weak:[]},q.armor),killedBy:q.killedBy||['arrow'],                                             // armor zones: 'head' | 'torso' | 'legs'
+   alive:true,dieT:0,id:n,state:r.length?S_PATROL:S_IDLE,meter:0,t:0,home:yw,px:x,pz:z,pyaw:yw,wp:0,wt:-1,ph:n*2.1,ly:yw,lx:x,lz:z,sx:x,sz:z,ss:0,wit:0,wk:0,since:-1,nw:0,nk:'',ps:null,lt:0,plt:0,lk:0,lc:0,lw:0,gz:0,fdir:0,landed:0}},
+ cov(q,n){const k=q[0],x=q[1],z=q[2],y=T(x,z);return k==='wall'?{k,x,z,y,w:q[3],d:q[4],h:q[5],seed:n,pr:q[6]||null}:{k,x,z,y,r:q[3],h:q[4],seed:n}},      // ['wall',x,z,w,d,h] | ['bush'|'rock',x,z,r,h]
+ load(i){const d=LEVELS[i],A=d.ai||{};Config.gustAmount=d.gust;this.ai=A;
+  Config.nightVisionScale=nz(A.nightVisionScale,AIB.nv);Config.hearingScale=nz(A.hearingScale,AIB.hs);Config.patrolSpeed=AIB.ps*nz(A.patrolSpeedScale,1);
+  if(this.last!==i){this.last=i;if(A.missPolicy)Config.missPolicy=A.missPolicy}           // a level's missPolicy applies when the level STARTS; retries keep the DEV-button choice
+  FLAT=d.flat?1:0;Plate.use(d);this.cur={name:d.name,fg:d.fg||'',ink:d.ink||0,inn:d.enemies.some(q=>q.inn),hold:d.hold||0,fx:!!d.fx,killcam:!!d.killcam,card:d.card||null,wind:d.windSpeed,wx:sin(d.windHead)*d.windSpeed,wz:cos(d.windHead)*d.windSpeed,
+   enemies:d.enemies.map((q,n)=>this.enemy(q,n)),cover:d.cover.map((q,n)=>this.cov(q,n)),
+   trees:d.trees.map(([x,z,h,type],n)=>({x,z,y:T(x,z),h,type,seed:n}))};
+  for(const e of this.cur.enemies)if(e.pvi>=0)e.pv=this.cur.cover[e.pvi]||null;      // props: tent walker / tower sentry know their prop
+  this.cur.inn=this.cur.enemies.find(q=>q.inn)||false;      // the interior soldier (or false): looked up once per load, not per frame
+  if(d.facing){const e0=this.cur.enemies[0],yf=d.facing[this.fc=((this.fc|0)+1)%d.facing.length]*D2R;e0.yaw=e0.home=e0.pyaw=e0.ly=yf}      // TEST levels: guard faces left / right on alternate loads (tests the death mirror both ways)
+  Arrows.forEach(a=>{a.on=0;a.stuck=0});Particles.a.forEach(p=>p.l=0);Pops.forEach(p=>p.on=0);Slow.reset();Shake.a=0;Intro.reset(this.cur);
+  Game.slow=1;Game.failReason='';Game.fail=null;Game.lastLand=null;AI.reset();Freeze.on=0;Aim.yaw=Aim.ty=atan2(3,42);Aim.pitch=Aim.tp=0;Aim.yawv=Aim.pitchv=0;Aim.sy=Aim.sp=0;Sight.valid=false;Sight.vis=0;Camera.snapTo();BowRig.reset()},
+ update(dt){for(const e of this.cur.enemies)if(!e.alive){e.dieT+=dt;if(e.skin==='soldier'&&e.landed===0&&e.dieT>=Foe.landT()){e.landed=1;Foe.onLand(e)}}for(const p of Pops)if(p.on){p.t+=dt;if(p.t>1.1)p.on=0}}};
+
+// ===== AIM STATE (angles, not pixels) + sway =====
+const Rng={s:20240611,next(){let t=this.s+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296}};   // mulberry32: seeded, so sway is deterministic per draw
+const Aim={yaw:0,pitch:0,ty:0,tp:0,yawv:0,pitchv:0,sy:0,sp:0,d:0,td:0,calm:0,fat:0,cancel:0,ph:[0,1,2,3],fireYaw:0,firePitch:0,fireR:0};   // yaw/pitch = smoothed pointer aim; sy/sp = sway (rad); VIEW = yaw+sy, pitch+sp
+const Sight={yaw:0,pitch:0,R:35,kind:0,valid:false,vis:0};                    // Sight.* = direction/range the player SAW on the last rendered frame (what you see is what you shoot)
+function drawAt(td){const u=clamp(td/Config.drawTime,0,1);return .65*(1-(1-u)*(1-u))+.35*sstep(u)}
+// ----- BREATH CYCLE: sway is a pure function of td (seconds since the draw began). No hold-breath button: the archer's own breathing sets the rhythm.
+//   0 .. settle      INHALE   loading the bow, sway is large (maxSway)
+//   settle .. peak   EXHALE   sway eases down to its minimum (minSway)
+//   peak .. holdEnd  WINDOW   the exhale has settled: tiny residual wander. This is the moment to loose.
+//   holdEnd ..       FATIGUE  muscles tire: sway grows to fatSway over fatLen s, plus a fast tremor
+// Outputs: Aim.sy / Aim.sp (rad), Aim.fat 0..1 (viewmodel shake, pin glow, audio), Aim.calm 0..1 (1 inside the window: pin glow + audio).
+function swayAt(td){const B=Config.breath,p=Aim.ph,
+ rise=sstep((td-B.settle)/(B.peak-B.settle)),                                       // 0 -> 1 while the exhale settles
+ fat=sstep((td-B.holdEnd)/B.fatLen),                                                // 0 -> 1 as the arm tires
+ amp=lerp(lerp(B.maxSway,B.minSway,rise),B.fatSway,fat)*.001*sstep(td/.25),         // mrad -> rad, eased in from zero at the start of the draw
+ a=sin(td*1.7+p[0])*.62+sin(td*2.9+p[1])*.38,                                       // slow wander (yaw), no time warping so no velocity spikes
+ tr=sin(td*9.3+p[2])*.25*fat,                                                       // fast tremor, only once tired
+ br=sin(td*2.2+p[3])*.5*(1-.85*rise*(1-fat)),                                       // chest rise and fall: nearly gone inside the window, returns with fatigue
+ b=sin(td*1.3+p[2])*.62+sin(td*2.3+p[3])*.38+br;                                    // slow wander (pitch) + breath
+ Aim.sy=(a+tr)*amp;Aim.sp=(b+tr)*amp;Aim.fat=fat;Aim.calm=rise*(1-fat)}
+
+// ===== CAMERA: exact critically damped springs on position, yaw, pitch, FOV =====
+function springAxis(o,k,target,omega,dt){const vk=k+'v',v=o[vk]||0,d=o[k]-target,e=Math.exp(-omega*dt),c=v+omega*d;o[k]=target+(d+c*dt)*e;o[vk]=(v-omega*c*dt)*e}
+const CKEYS=['x','y','z','yaw','pitch','fov'];
+// The camera sits at the archer's eye for the WHOLE shot. View direction == aim + sway (no lagged follow); only FOV is sprung (tiny focus effect).
+const Camera={x:0,y:1.6,z:0,yaw:0,pitch:0,fov:Config.fov0*D2R,fovv:0,tfov:Config.fov0*D2R,pv:{x:0,y:1.6,z:0,yaw:0,pitch:0,fov:Config.fov0*D2R},
+ snapTo(){this.tfov=Config.fov0*D2R;this.x=EYE.x;this.y=EYE.y;this.z=EYE.z;this.yaw=Aim.yaw+Aim.sy;this.pitch=Aim.pitch+Aim.sp;this.fov=this.tfov;this.fovv=0;for(const k of CKEYS)this.pv[k]=this[k]},
+ update(dt){for(const k of CKEYS)this.pv[k]=this[k];this.x=EYE.x;this.y=EYE.y;this.z=EYE.z;this.yaw=Aim.yaw+Aim.sy;this.pitch=Aim.pitch+Aim.sp;
+  springAxis(this,'fov',this.tfov,Config.zoomOmega,dt);this.fov=clamp(this.fov,.06,1.4)}};
+const zoomNow=()=>tan(Config.fov0*D2R/2)/tan(Camera.fov/2);       // magnification from FOV
+
+// ===== BALLISTICS: one RK4 stepper shared by live arrow, predictor and zeroing =====
+const gustF=t=>sin(t*1.1)*.6+sin(t*2.7+1.3)*.3+sin(t*5.3+.4)*.1;
+const Env={wx:0,wz:0,gust:1,ex:0,ez:0};
+function envAt(e,t){const sp=hypot(e.wx,e.wz),gs=e.gust&&sp>0?gustF(t)*Config.gustAmount:0,u=sp>0?(sp+gs)/sp:1,S=Config.windGameScale;e.ex=e.wx*u*S;e.ez=e.wz*u*S}
+const _k=[0,1,2,3].map(()=>new Float64Array(3));
+function accel(vx,vy,vz,e,o){const rx=vx-e.ex,rz=vz-e.ez,k=Config.dragK*sqrt(rx*rx+vy*vy+rz*rz);o[0]=-k*rx;o[1]=-Config.g*Config.gravityScale-k*vy;o[2]=-k*rz}   // g + quadratic drag vs air
+function stepArrow(s,dt,e){envAt(e,s.t);const h=dt/2,k0=_k[0],k1=_k[1],k2=_k[2],k3=_k[3],vx=s.vx,vy=s.vy,vz=s.vz;
+ accel(vx,vy,vz,e,k0);
+ const v1x=vx+h*k0[0],v1y=vy+h*k0[1],v1z=vz+h*k0[2];accel(v1x,v1y,v1z,e,k1);
+ const v2x=vx+h*k1[0],v2y=vy+h*k1[1],v2z=vz+h*k1[2];accel(v2x,v2y,v2z,e,k2);
+ const v3x=vx+dt*k2[0],v3y=vy+dt*k2[1],v3z=vz+dt*k2[2];accel(v3x,v3y,v3z,e,k3);
+ s.px=s.x;s.py=s.y;s.pz=s.z;const d6=dt/6;
+ s.x+=d6*(vx+2*v1x+2*v2x+v3x);s.y+=d6*(vy+2*v1y+2*v2y+v3y);s.z+=d6*(vz+2*v1z+2*v2z+v3z);
+ s.vx+=d6*(k0[0]+2*k1[0]+2*k2[0]+k3[0]);s.vy+=d6*(k0[1]+2*k1[1]+2*k2[1]+k3[1]);s.vz+=d6*(k0[2]+2*k1[2]+2*k2[2]+k3[2]);s.t+=dt;s.age+=dt}
+const speedAt=u=>sqrt(2*Config.eta*(Config.Fpk*Config.Ldraw*Math.pow(clamp(u,0,1),Config.pExp+1)/(Config.pExp+1))/Config.mEff);
+
+// ===== LAUNCH GEOMETRY: nock offset (parallax) + zeroing by shooting method =====
+const A={fx:0,fy:0,fz:1,rx:1,rz:0,ux:0,uy:1,uz:0},P0={x:0,y:0,z:0},DV={x:0,y:0,z:1};
+function aimBasis(yaw,pitch){const cp=cos(pitch),sp=sin(pitch),sy=sin(yaw),cy=cos(yaw);A.fx=cp*sy;A.fy=sp;A.fz=cp*cy;A.rx=cy;A.rz=-sy;A.ux=-sp*sy;A.uy=cp;A.uz=-sp*cy}
+function nockPos(o){const C=Config;o.x=EYE.x+A.rx*C.nockX+A.ux*C.nockY+A.fx*C.nockZ;o.y=EYE.y+A.uy*C.nockY+A.fy*C.nockZ;o.z=EYE.z+A.rz*C.nockX+A.uz*C.nockY+A.fz*C.nockZ}
+function dirWithPhi(bx,by,bz,phi,o){const c=cos(phi),s=sin(phi),rx=A.rx,rz=A.rz,cx=-rz*by,cy=rz*bx-rx*bz,cz=rx*by,rd=rx*bx+rz*bz,k=1-c;   // Rodrigues about aim-right axis, +phi = pitch up
+ o.x=bx*c-cx*s+rx*rd*k;o.y=by*c-cy*s;o.z=bz*c-cz*s+rz*rd*k}
+const ZE={wx:0,wz:0,gust:0,ex:0,ez:0},ZS={x:0,y:0,z:0,px:0,py:0,pz:0,vx:0,vy:0,vz:0,t:0,age:0};
+// zeroPhi: pitch correction phi so a FULL-DRAW, no-wind arrow from the nock (A basis + P0 already set) crosses the sight line at distance Dz (shooting method, same RK4 stepper)
+function zeroPhi(Dz,phi){const qx=EYE.x+A.fx*Dz,qy=EYE.y+A.fy*Dz,qz=EYE.z+A.fz*Dz;let bx=qx-P0.x,by=qy-P0.y,bz=qz-P0.z;const bl=hypot(bx,by,bz);bx/=bl;by/=bl;bz/=bl;
+ const vF=speedAt(1),s=ZS;
+ for(let it=0;it<12;it++){dirWithPhi(bx,by,bz,phi,DV);s.x=s.px=P0.x;s.y=s.py=P0.y;s.z=s.pz=P0.z;s.vx=DV.x*vF;s.vy=DV.y*vF;s.vz=DV.z*vF;s.t=0;s.age=0;
+  let m=NaN,pd=(s.x-EYE.x)*A.fx+(s.y-EYE.y)*A.fy+(s.z-EYE.z)*A.fz;
+  for(let i=0;i<700;i++){stepArrow(s,Config.step,ZE);const d=(s.x-EYE.x)*A.fx+(s.y-EYE.y)*A.fy+(s.z-EYE.z)*A.fz;
+   if(d>=Dz){const u=(Dz-pd)/((d-pd)||1);m=(lerp(s.px,s.x,u)-qx)*A.ux+(lerp(s.py,s.y,u)-qy)*A.uy+(lerp(s.pz,s.z,u)-qz)*A.uz;break}pd=d}
+  if(m!==m)break;phi=clamp(phi-m/Dz,0,.8);if(abs(m)<1e-4)break}
+ return phi}
+// DROP TABLE: built ONCE at boot, indexed by range (m) and aim pitch. Deterministic: no per-frame solving, no warm-start state => no flicker.
+const Drop={pb:[-.55,-.3,-.12,0,.12,.3,.45,.6],d0:4,dd:2,n:61,phi:null};
+function buildDrop(){const D=Drop;D.phi=D.pb.map(pt=>{aimBasis(0,pt);nockPos(P0);const row=new Float32Array(D.n);let phi=.02;for(let i=0;i<D.n;i++){phi=zeroPhi(D.d0+i*D.dd,phi);row[i]=phi}return row})}
+function phiAt(R,pitch){const D=Drop,x=clamp((R-D.d0)/D.dd,0,D.n-1.0001),i=x|0,fx=x-i,pb=D.pb;let j=0;while(j<pb.length-2&&pitch>pb[j+1])j++;
+ const fy=clamp((pitch-pb[j])/(pb[j+1]-pb[j]),0,1),a=D.phi[j],b=D.phi[j+1];return lerp(lerp(a[i],a[i+1],fx),lerp(b[i],b[i+1],fx),fy)}
+// launch along the sight line: arrow leaves the nock, passes through the pin at range R (full draw, calm air). Partial draw / wind move the impact.
+function launchState(s,yaw,pitch,u,t,R){aimBasis(yaw,pitch);nockPos(P0);R=clamp(R,Config.minRange,Config.maxRange);
+ let bx=EYE.x+A.fx*R-P0.x,by=EYE.y+A.fy*R-P0.y,bz=EYE.z+A.fz*R-P0.z;const bl=hypot(bx,by,bz);bx/=bl;by/=bl;bz/=bl;dirWithPhi(bx,by,bz,phiAt(R,pitch),DV);const v=speedAt(u);
+ s.x=s.px=P0.x;s.y=s.py=P0.y;s.z=s.pz=P0.z;s.vx=DV.x*v;s.vy=DV.y*v;s.vz=DV.z*v;s.t=t;s.age=0;return s}
+
+// ===== COLLISION (3D swept segment) =====
+function segSph(px,py,pz,dx,dy,dz,cx,cy,cz,r){const fx=px-cx,fy=py-cy,fz=pz-cz,a=dx*dx+dy*dy+dz*dz,b=2*(fx*dx+fy*dy+fz*dz),c=fx*fx+fy*fy+fz*fz-r*r;if(c<=0)return 0;const D=b*b-4*a*c;if(D<0||a===0)return-1;const t=(-b-sqrt(D))/(2*a);return t>=0&&t<=1?t:-1}
+let _t0=0,_t1=1;
+function slab(p,d,a,b){if(abs(d)<1e-9)return p>=a&&p<=b;let u=(a-p)/d,v=(b-p)/d;if(u>v){const t=u;u=v;v=t}if(u>_t0)_t0=u;if(v<_t1)_t1=v;return _t0<=_t1}
+function segBox(s,x0,y0,z0,x1,y1,z1){_t0=0;_t1=1;return slab(s.px,s.x-s.px,x0,x1)&&slab(s.py,s.y-s.py,y0,y1)&&slab(s.pz,s.z-s.pz,z0,z1)?_t0:-1}
+function segCirc2(px,pz,dx,dz,cx,cz,r){const fx=px-cx,fz=pz-cz,a=dx*dx+dz*dz,b=2*(fx*dx+fz*dz),c=fx*fx+fz*fz-r*r;if(c<=0)return 0;const D=b*b-4*a*c;if(D<0||a===0)return-1;const t=(-b-sqrt(D))/(2*a);return t>=0&&t<=1?t:-1}
+const Hit={kind:0,e:null,part:0,tr:null,x:0,y:0,z:0,t:0};   // kind: 1 enemy, 2 ground, 3 tree, 4 out of bounds
+function collide(s){let bt=2,kind=0,be=null,bp=0,btr=null;const dx=s.x-s.px,dy=s.y-s.py,dz=s.z-s.pz,L=Level.cur,
+  bx0=(s.px<s.x?s.px:s.x)-.02,bx1=(s.px<s.x?s.x:s.px)+.02,bz0=(s.pz<s.z?s.pz:s.z)-.02,bz1=(s.pz<s.z?s.z:s.pz)+.02;       // segment XZ bounds: conservative reject before the per-object tests (results identical)
+ for(const e of L.enemies){if(!e.alive||e.dorm)continue;if(bx1<e.x-.3||bx0>e.x+.3||bz1<e.z-.3||bz0>e.z+.3)continue;                // enemy hit shapes lie within +-.25 x +-.16 (head sphere r .12)
+  let t=segSph(s.px,s.py,s.pz,dx,dy,dz,e.x,e.y+1.62,e.z,.12);if(t>=0&&t<bt){bt=t;kind=1;be=e;bp=1}
+  t=segBox(s,e.x-.25,e.y+.68,e.z-.16,e.x+.25,e.y+1.46,e.z+.16);if(t>=0&&t<bt){bt=t;kind=1;be=e;bp=0}
+  t=segBox(s,e.x-.2,e.y,e.z-.14,e.x+.2,e.y+.68,e.z+.14);if(t>=0&&t<bt){bt=t;kind=1;be=e;bp=2}}
+ for(const tr of L.trees){if(bx1<tr.x-.34||bx0>tr.x+.34||bz1<tr.z-.34||bz0>tr.z+.34)continue;const t=segCirc2(s.px,s.pz,dx,dz,tr.x,tr.z,.32);if(t>=0&&t<bt){const y=s.py+dy*t;if(y<tr.y+tr.h&&y>tr.y-1){bt=t;kind=3;btr=tr;be=null}}}
+ for(const v of L.cover)if(v.pr&&v.pr.sol){const hw=v.w/2+.02;if(bx1<v.x-hw||bx0>v.x+hw||bz1<v.z-v.d/2-.02||bz0>v.z+v.d/2+.02)continue;const t=segBox(s,v.x-v.w/2,v.y,v.z-v.d/2,v.x+v.w/2,v.y+v.h,v.z+v.d/2);if(t>=0&&t<bt){bt=t;kind=3;be=null;btr=null}}      // TEST-2 props: solid boxes stop arrows (wood thunk)
+ /* T() never exceeds 1.5 m (1.0 + .5 - .004z, z>=0), so the terrain test is skipped for high segments */
+ if(s.y<=1.5&&s.y<=T(s.x,s.z)){let lo=0,hi=1;for(let i=0;i<14;i++){const m=(lo+hi)/2;if(s.py+dy*m<T(s.px+(s.x-s.px)*m,s.pz+dz*m))hi=m;else lo=m}if(hi<bt){bt=hi;kind=2;be=null}}
+ if(!kind&&(abs(s.x)>220||s.z>240||s.z<-40||s.y<-60||s.age>7)){kind=4;bt=1}
+ if(kind===1&&be.inn&&!Ink.open(s.px+dx*bt,s.py+dy*bt,s.pz+dz*bt)){kind=3;be=null;btr=null}      // interior soldier: the hit point must project inside a door / window opening, else the arrow stops in the wall (wood thunk)
+ if(kind===1&&be.pv&&!Prop.hit(be,s.px+dx*bt,s.py+dy*bt,s.pz+dz*bt)){kind=3;be=null;btr=null}      // tent walker / tower sentry: only the visible part can be hit
+ if(!kind)return null;
+ Hit.kind=kind;Hit.e=be;Hit.part=bp;Hit.tr=btr;Hit.t=bt;Hit.x=s.px+dx*bt;Hit.y=s.py+dy*bt;Hit.z=s.pz+dz*bt;return Hit}
+
+// ===== SIGHT-LINE RANGE: straight ray from the eye through the pin, first solid (enemy / tree / terrain). Drives the range-adjusted pin. =====
+const RS={x:0,y:0,z:0,px:0,py:0,pz:0,age:0};
+function rayRange(yaw,pitch){const cp=cos(pitch),dx=cp*sin(yaw),dy=sin(pitch),dz=cp*cos(yaw),st=2,mx=Config.maxRange+4;Sight.kind=0;Sight.R=Config.autoRange?Config.maxRange:Config.zeroDist;
+ if(!Config.autoRange){Sight.R=Config.zeroDist;return Sight.R}
+ RS.x=EYE.x;RS.y=EYE.y;RS.z=EYE.z;RS.age=0;
+ for(let d=st;d<=mx;d+=st){RS.px=RS.x;RS.py=RS.y;RS.pz=RS.z;RS.x=EYE.x+dx*d;RS.y=EYE.y+dy*d;RS.z=EYE.z+dz*d;
+  const h=collide(RS);if(h){if(h.kind!==4){Sight.kind=h.kind;Sight.R=hypot(h.x-EYE.x,h.y-EYE.y,h.z-EYE.z)}return Sight.R}}
+ return Sight.R}
+
+// ===== ARROWS / PARTICLES / POPUPS (pools) =====
+const Arrows=Array.from({length:8},()=>({on:0,x:0,y:0,z:0,px:0,py:0,pz:0,vx:0,vy:0,vz:0,t:0,age:0,stuck:0,att:null,hx:0,hy:0,hz:0,dx:0,dy:0,dz:1,ox:0,oy:0,oz:0,embed:0,k:0,th:0,tn:0,tr:new Float32Array(60)}));
+let arrowIdx=0,cur=Arrows[0];
+function fire(yaw,pitch,u,R){const a=Arrows[arrowIdx++%8];Aim.fireYaw=yaw;Aim.firePitch=pitch;Aim.fireR=R;launchState(a,yaw,pitch,u,Game.time,R);a.on=1;a.stuck=0;a.att=null;a.k=0;a.th=0;a.tn=0;a.embed=0;cur=a;Slow.arm(a)}
+const Particles={a:Array.from({length:160},()=>({l:0,m:1,x:0,y:0,z:0,vx:0,vy:0,vz:0,s:.03,c:0})),i:0,
+ spawn(x,y,z,n,c,sp){for(let k=0;k<n;k++){const p=this.a[this.i++%160],th=rand()*6.283,ph=Math.acos(rand()*1.6-.6),v=sp*(.3+rand());p.l=p.m=.4+rand()*.6;p.x=x;p.y=y;p.z=z;p.vx=sin(ph)*cos(th)*v;p.vy=cos(ph)*v;p.vz=sin(ph)*sin(th)*v;p.s=.025+rand()*.05;p.c=c}},
+ update(dt){for(const p of this.a)if(p.l>0){p.l-=dt;p.vy-=9.8*dt;const d=1-2.5*dt;p.vx*=d;p.vz*=d;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt}}};
+const Pops=Array.from({length:4},()=>({on:0,x:0,y:0,z:0,t:0,s:''}));let popI=0;
+const popup=(x,y,z,s)=>{const p=Pops[popI++%4];p.on=1;p.x=x;p.y=y;p.z=z;p.t=0;p.s=s};
+
+// ===== PREDICTOR (same stepArrow + collide + launchState as the live arrow) =====
+const Pred={n:0,x:new Float32Array(440),y:new Float32Array(440),z:new Float32Array(440),nt:0,tk:new Float32Array(80),end:0,hx:0,hy:0,hz:0,
+ s:{x:0,y:0,z:0,px:0,py:0,pz:0,vx:0,vy:0,vz:0,t:0,age:0},env:{wx:0,wz:0,gust:0,ex:0,ez:0},
+ run(yaw,pitch,R,u){const Tr=Config.sightTier;this.n=0;this.nt=0;this.end=0;if(!Tr)return;const s=this.s,e=this.env;
+  launchState(s,yaw,pitch,u,Game.time,R);
+  e.wx=Tr>=3?Level.cur.wx:0;e.wz=Tr>=3?Level.cur.wz:0;e.gust=Tr>=3?1:0;
+  const maxD=Tr===1?10:Tr===2?45:220;let dist=0,next=0,nextTick=10;
+  for(let i=0;i<1400;i++){stepArrow(s,Config.step,e);dist+=hypot(s.x-s.px,s.y-s.py,s.z-s.pz);const hit=collide(s);
+   if(!hit&&dist>=next&&this.n<440){this.x[this.n]=s.x;this.y[this.n]=s.y;this.z[this.n++]=s.z;next+=.5}
+   if(Tr===3&&this.nt<20&&hypot(s.x-EYE.x,s.z-EYE.z)>=nextTick){const j=this.nt++*4;this.tk[j]=s.x;this.tk[j+1]=s.y;this.tk[j+2]=s.z;this.tk[j+3]=nextTick;nextTick+=10}
+   if(hit){this.end=1;this.hx=hit.x;this.hy=hit.y;this.hz=hit.z;return}
+   if(dist>=maxD){this.end=2;this.hx=s.x;this.hy=s.y;this.hz=s.z;return}}}};
+
+// ===== AI / STEALTH (logic only, NO drawing: drawEnemy / drawCover / drawAIDebug read this state, so the renderer can be swapped) =====
+const S_IDLE=0,S_PATROL=1,S_NOTICE=2,S_ALARMED=3,S_DEAD=4,TAU=2*PI,LS={px:0,py:0,pz:0,x:0,y:0,z:0};      // LS = scratch segment: no per-tick allocation anywhere below
+const wrapA=a=>a-TAU*Math.round(a/TAU);
+function turnTo(g,want,dt){let d=wrapA(want-g.yaw);const m=(g.turnRate||Config.turnRate)*D2R*dt;
+ if(g.skin==='soldier'&&abs(d)>2.3){const dp=((want-g.yaw)%TAU+TAU)%TAU;d=g.yaw>=0?dp:dp-TAU}      // sprite guards turn around THROUGH THE FRONT (there is no back-view art): side -> front -> side
+ g.yaw=wrapA(g.yaw+clamp(d,-m,m))}
+// vertical cylinder vs segment (cover bush/rock): 2D overlap interval x height band
+function cylHit(ax,ay,az,dx,dy,dz,cx,cz,r,y0,y1){const fx=ax-cx,fz=az-cz,a=dx*dx+dz*dz,c=fx*fx+fz*fz-r*r;let t0=0,t1=1;
+ if(a<1e-12){if(c>0)return false}
+ else{const b=2*(fx*dx+fz*dz),D=b*b-4*a*c;if(D<0)return false;const q=sqrt(D);t0=(-b-q)/(2*a);t1=(-b+q)/(2*a);if(t1<0||t0>1)return false;if(t0<0)t0=0;if(t1>1)t1=1}
+ const ya=ay+dy*t0,yb=ay+dy*t1;return min(ya,yb)<=y1&&max(ya,yb)>=y0}
+function treeBlocks(ax,ay,az,bx,by,bz){const TR=Level.cur.trees,dx=bx-ax,dy=by-ay,dz=bz-az;                 // trunk r, same height test as collide()
+ for(let i=0;i<TR.length;i++){const tr=TR[i],t=segCirc2(ax,az,dx,dz,tr.x,tr.z,Config.trunkR);if(t>=0){const y=ay+dy*t;if(y<tr.y+tr.h&&y>tr.y-1)return true}}return false}
+function coverBlocks(ax,ay,az,bx,by,bz){const CV=Level.cur.cover,s=LS,dx=bx-ax,dy=by-ay,dz=bz-az;s.px=ax;s.py=ay;s.pz=az;s.x=bx;s.y=by;s.z=bz;   // cover blocks SIGHT only (never in collide())
+ for(let i=0;i<CV.length;i++){const v=CV[i];
+  if(v.w>0){if(segBox(s,v.x-v.w*.5,v.y-1,v.z-v.d*.5,v.x+v.w*.5,v.y+v.h,v.z+v.d*.5)>=0)return true}
+  else if(cylHit(ax,ay,az,dx,dy,dz,v.x,v.z,v.r,v.y-1,v.y+v.h))return true}return false}
+const losClear=(ax,ay,az,bx,by,bz)=>!treeBlocks(ax,ay,az,bx,by,bz)&&!coverBlocks(ax,ay,az,bx,by,bz);
+// 0 = not seen, else the meter-rate multiplier (x1.5 close, x.6 near the cone edge). Cone on the ground plane (range*nightVisionScale, fov) AND clear LOS from the eye.
+function aiSees(g,tx,ty,tz){const v=g.vision,dx=tx-g.x,dz=tz-g.z,d=hypot(dx,dz);if(d>v.range*Config.nightVisionScale)return 0;
+ const half=v.fovDeg*.5*D2R,cs=d<1e-6?1:(sin(g.yaw)*dx+cos(g.yaw)*dz)/d;if(d>.3&&cs<cos(half))return 0;
+ if(!losClear(g.x,g.y+v.eyeH,g.z,tx,ty,tz))return 0;
+ let m=d<Config.closeR?Config.closeMul:1;if(d>.3&&Math.acos(clamp(cs,-1,1))>half*Config.edgeFrac)m*=Config.edgeMul;return m}
+const AI={NAMES:['IDLE','PATROL','NOTICING','ALARMED','DEAD'],acc:0,time:0,fr:0,al:null,seq:0,ki:0,debug:0,hot:0,vig:0,nk:'',K:[{t:-9,x:0,y:0,z:0,q:0},{t:-9,x:0,y:0,z:0,q:0}],   // K = ring of the last 2 kills (witness window)
+ reset(){this.acc=0;this.time=0;this.fr=0;this.hot=0;this.vig=0;this.al=null;this.nk='';this.seq=0;this.ki=0;for(const k of this.K){k.t=-9;k.q=0}},
+ update(dt){const f=fsm.cur,on=f==='READY'||f==='AIMING'||f==='FLIGHT'||f==='RESOLVE';this.vig+=((on?this.hot:0)-this.vig)*(1-exp(-dt*8));if(!on)return;const h=1/Config.aiHz;     // vig: smoothed 'a meter is filling' level for the HUD vignette
+     // sim is 120 Hz and already x Game.slow; AI ticks at 20 Hz inside
+  const iw=Level.cur.inn;if(iw)Ink.simIn();this.acc+=dt;while(this.acc>=h){this.acc-=h;this.tick(h);if(this.al)break}if(iw)Ink.simOut();this.fr=clamp(this.acc/h,0,1)},   // iw (TEST-5): interior soldiers walk in SIM metres during the ticks; outside them e.x/y/z are the glued WORLD point (collide, arrows, sounds)
+ tick(h){const E=Level.cur.enemies,n=E.length,C=Config,MW=(Level.ai&&Level.ai.minWarn)||0;this.time+=h;this.hot=0;      // MW = level `ai.minWarn` (s): detection floor, no meter goes 0 -> 1 faster than this (default 0 = legacy)
+
+  for(let i=0;i<n;i++){const g=E[i];if(g.dorm){this.wake(g);continue}if(!g.alive){g.state=S_DEAD;continue}if(g.state===S_ALARMED)continue;
+   g.px=g.x;g.pz=g.z;g.pyaw=g.yaw;
+   for(let k=0;k<2;k++){const r=this.K[k];if(r.q&&this.time-r.t<C.witnessWindow)this.witness(g,r)}      // a guard who turns into view within ~1 s of the hit still witnesses it
+   let m=0;for(let j=0;j<n;j++){const b=E[j];if(b.alive)continue;const q=aiSees(g,b.x,b.y+C.bodyY,b.z);if(q>m){m=q;g.sx=b.x;g.sz=b.z}}   // bodies are the dead enemies still in the list
+   g.ss=m>0?1:0;const nt=g.vision.noticeTime;
+   if(m>0){g.meter=MW>0?min(1,g.meter+h*min(nt>0?m/nt:1e9,1/MW)):nt>0?min(1,g.meter+h*m/nt):1;g.lx=g.sx;g.lz=g.sz;if(g.meter>this.hot)this.hot=g.meter}
+   else if(g.meter>0){g.meter=max(0,g.meter-h/C.drain);if(g.meter===0)g.wit=0}
+   if(g.nw>0){const NW=(Level.ai&&Level.ai.noiseWarn)||1;g.nw=max(0,g.nw-h);g.meter=max(g.meter,1-g.nw/NW);if(g.since<0)g.since=this.time;if(g.nw===0){this.nk=g.nk;this.alarm(g,'NOISE HEARD');return}}      // noiseWarn countdown: the meter rises with it (visible), he faces the sound; killing him cancels it
+   if(g.meter>0){if(g.since<0){g.since=this.time;SFX.notice(g)}}else g.since=-1;                                                         // since = AI time the meter first left 0 (how long the player was warned)
+   if(g.meter>=1){this.alarm(g,g.wit?'KILL WITNESSED':'BODY FOUND');return}
+   g.state=g.meter>0?S_NOTICE:g.route.length?S_PATROL:S_IDLE;
+   if(g.state===S_NOTICE){if(g.skin==='soldier')Foe.halt(g);turnTo(g,atan2(g.lx-g.x,g.lz-g.z),h)}                       // freeze and look at what he noticed
+   else if(g.state===S_IDLE){if(g.look)Foe.idleLook(g,h);else{g.t+=h;turnTo(g,g.home+(g.scanDeg!==undefined?g.scanDeg:C.scanDeg)*D2R*sin(TAU*g.t/C.scanPeriod+g.ph),h)}}
+   else if(g.skin==='soldier')Foe.patrol(g,h);else this.patrol(g,h)}},
+ patrol(g,h){const C=Config,R=g.route,w=R[g.wp];
+  if(g.wt>=0){g.t+=h;turnTo(g,g.ly+C.sweepDeg*D2R*sin(TAU*g.t/C.sweepPeriod),h);g.wt-=h;if(g.wt<=0){g.wt=-1;g.wp=(g.wp+1)%R.length}return}   // waiting: look-sweep
+  const dx=w.x-g.x,dz=w.z-g.z,d=hypot(dx,dz);
+  if(d<.08){g.wt=w.wait||0;g.t=0;g.ly=w.look===undefined?g.yaw:w.look*D2R;if(g.wt<=0){g.wt=-1;g.wp=(g.wp+1)%R.length}return}
+  const want=atan2(dx,dz);turnTo(g,want,h);
+  if(abs(wrapA(want-g.yaw))<.35){const s=min(d,C.patrolSpeed*h);g.x+=dx/d*s;g.z+=dz/d*s;g.y=T(g.x,g.z)}},   // walk only once roughly facing the waypoint
+ wake(g){const sp=g.sp,E=Level.cur.enemies;for(const t of[sp].concat(sp.alt||[])){const w=E[t.after];if(w&&!w.alive&&w.dieT>=t.delay){g.dorm=0;if(t.face){const a=atan2(w.x-g.x,w.z-g.z);g.yaw=g.pyaw=g.ly=a;g.wt=t.hold||3;g.t=0}return}}},   // dormant enemy wakes when `after` has been dead `delay` s, or via an `alt` trigger (e.g. the tower sentry dies first): he then faces the dead man and holds `hold` s
+ witness(g,r){if(g.wk!==r.q&&aiSees(g,r.x,r.y+Config.killY,r.z)>0){g.wk=r.q;g.wit=1;g.meter=max(g.meter,Level.ai&&Level.ai.minWarn>0?.02:Config.witnessMeter);if(g.since<0)g.since=this.time;g.lx=r.x;g.lz=r.z}},
+ onKill(e){const r=this.K[this.ki++&1],E=Level.cur.enemies;r.t=this.time;r.x=e.x;r.y=e.y;r.z=e.z;r.q=++this.seq;e.state=S_DEAD;
+  for(let i=0;i<E.length;i++){const g=E[i];if(g.dorm&&g.alive)this.wake(g);if(g.alive&&!g.dorm&&g.state!==S_ALARMED)this.witness(g,r)}},
+ onNoise(x,y,z,rad,who){const nk=this.nk;this.nk='';if(Config.missPolicy!=='noise'||this.al)return;const E=Level.cur.enemies;let bg=null,bd=1e9;       // only the 'noise' policy listens; 'who' = the enemy that was struck (always hears his own armor)
+  if(who&&who.alive&&who.state!==S_ALARMED){this.hear(who,nk,x,z);return}
+  for(let i=0;i<E.length;i++){const g=E[i];if(!g.alive||g.dorm||g.state===S_ALARMED)continue;const d=hypot(g.x-x,g.z-z);if(d<=rad*g.hearing.radius*Config.hearingScale&&d<bd){bd=d;bg=g}}
+  if(bg)this.hear(bg,nk,x,z)},
+ hear(g,nk,x,z){if(!((Level.ai&&Level.ai.noiseWarn)>0)){this.nk=nk;this.alarm(g,'NOISE HEARD');return}      // legacy: instant alarm. opt-in `ai.noiseWarn` (s): a countdown instead, with a visible meter
+  if(g.nw>0)return;g.nw=Level.ai.noiseWarn;g.nk=nk;g.lx=x;g.lz=z;if(g.since<0)g.since=this.time},
+ alarm(g,why){if(this.al)return;const w=g.since<0?0:this.time-g.since;Game.fail={cause:why==='KILL WITNESSED'?'witnessed':why==='BODY FOUND'?'body':'noise',why,guard:g.id,t:this.time,warn:w,noise:why==='NOISE HEARD'?this.nk:''};this.nk='';
+  g.state=S_ALARMED;g.meter=1;this.al=g;SFX.alarm(g);Game.failReason=why;if(fsm.cur==='AIMING'){Input.id=-1;BowRig.cancel()}fsm.go('ALARM')},
+ won(){const E=Level.cur.enemies;for(let i=0;i<E.length;i++)if(E[i].target&&E[i].alive)return false;return true}};
+
+// ===== BOW RIG (draw / string snap / kick / breath state read by the viewmodel art) =====
+const BowRig={draw:0,nocked:1,releaseAge:10,snap:0,kick:0,breath:0,weightedAngle:0,weightedAnglev:0,anchors:{},
+ reset(){this.draw=0;this.releaseAge=10;this.snap=this.kick=0;this.weightedAngle=this.weightedAnglev=0},
+ release(){this.releaseAge=0},cancel(){this.releaseAge=10},
+ update(dt){const aiming=fsm.cur==='AIMING';
+  this.draw+=((aiming?Aim.d:0)-this.draw)*(1-Math.exp(-dt*(aiming?35:80)));
+  springAxis(this,'weightedAngle',aiming?Aim.yawv*.5:0,Config.rigOmega,dt);       // viewmodel swings slightly against fast turns
+  this.releaseAge+=dt;this.snap=sin(this.releaseAge*6.283*Config.stringHz)*Math.exp(-this.releaseAge*Config.stringDecay);
+  this.kick=Math.exp(-this.releaseAge*24);this.breath=sin(Game.time*2.1)*Config.breathLift}};
+
+// ===== RAIN (night theme): screen-space streaks, tilted by wind =====
+const Rain={n:150,x:new Float32Array(150),y:new Float32Array(150),v:new Float32Array(150),
+ init(){for(let i=0;i<this.n;i++){this.x[i]=rand()*(W+200)-100;this.y[i]=rand()*H;this.v[i]=800+rand()*400}},
+ update(dt){const w=hudWind();for(let i=0;i<this.n;i++){this.y[i]+=this.v[i]*dt;this.x[i]+=w*14*dt;if(this.y[i]>H){this.y[i]-=H+30;this.x[i]=rand()*(W+200)-100}}},
+ draw(c){const w=hudWind()*.17;c.strokeStyle='rgba(170,200,230,.22)';c.lineWidth=1.2;c.beginPath();for(let i=0;i<this.n;i++){c.moveTo(this.x[i],this.y[i]);c.lineTo(this.x[i]+w,this.y[i]+14)}c.stroke()}};
+// ===== SHARED UI HELPERS + VIEWMODEL ART (kept from previous build; Astra bow/hands untouched) =====
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
+// ----- first-person viewmodel: leather arms/hands, riser, limbs, string snap (ported from Astra) -----
+const BowPaint={path(c,points,fill,stroke='#19191a',width=1.5){c.beginPath();for(const p of points){if(p.length===2)c.lineTo(p[0],p[1]);else c.bezierCurveTo(...p)}c.closePath();c.fillStyle=fill;c.fill();if(stroke){c.strokeStyle=stroke;c.lineWidth=width;c.stroke()}},
+ gradient(c,x0,y0,x1,y1,colors){const g=c.createLinearGradient(x0,y0,x1,y1);colors.forEach((v,i)=>g.addColorStop(i/(colors.length-1),v));return g},
+ line(c,points,color,width){c.beginPath();points.forEach(p=>c.lineTo(p.x,p.y));c.strokeStyle=color;c.lineWidth=width;c.lineCap='round';c.lineJoin='round';c.stroke()},
+ joint(s,t,l1,l2,sign=1){const dx=t.x-s.x,dy=t.y-s.y,d=clamp(Math.hypot(dx,dy),.001,l1+l2-.01),a=Math.atan2(dy,dx),b=Math.acos(clamp((l1*l1+d*d-l2*l2)/(2*l1*d),-1,1));return{x:s.x+Math.cos(a+sign*b)*l1,y:s.y+Math.sin(a+sign*b)*l1}},
+ arm(c,s,e,h,width){this.line(c,[s,e,h],'#10151a',width+5);const g=this.gradient(c,e.x-width,e.y,e.x+width,e.y,['#3c261f','#b97c4c','#ce9462','#654334']);this.line(c,[s,e,h],g,width);this.line(c,[{x:e.x-width*.17,y:e.y-9},{x:h.x-width*.12,y:h.y-5}],'#dfaa713b',width*.17)},
+ hand(c,x,y,angle,scale=1){c.save();c.translate(x,y);c.rotate(angle);c.scale(scale,scale);const leather=this.gradient(c,-30,-24,33,28,['#392a24','#a67348','#785034','#342922']);
+  this.path(c,[[-35,22],[-40,-1,-26,-31,-6,-29],[9,-33,31,-18,30,6],[28,30,8,38,-13,32]],leather);
+  for(let i=0;i<4;i++){const y=-21+i*11;this.path(c,[[1,y],[17,y-8,41,y-4,37,y+5],[29,y+12,12,y+13,4,y+7]],leather,'#2c211c',2);this.line(c,[{x:12,y:y+2},{x:28,y:y+3}],'#c5956155',1)}
+  this.path(c,[[-27,1],[-29,-18,-10,-27,4,-19],[17,-13,18,-3,6,1],[-5,3,-13,14,-20,15]],leather);
+  c.fillStyle='#292729';c.rotate(-.12);c.fillRect(-37,26,60,14);c.strokeStyle='#867c6a';c.lineWidth=1;c.strokeRect(-36,28,58,9);c.restore()}};
+Assets.fns.bowPerspective=(c,o)=>{const r=o.rig,d=r.draw,t=r.releaseAge,snap=r.snap||0,k=r.kick||0,lag=r.weightedAngle||0,aiming=fsm.cur==='AIMING',fatigue=aiming?Aim.fat*1.75:0;
+ c.translate(0,r.breath+k*6);c.rotate(clamp(lag*.1,-.09,.09)+sin(Game.time*27)*fatigue*.0016);
+ const grip={x:75+k*8,y:28+k*6},upper={x:360-d*29+snap*8,y:-303+d*19},lower={x:-59-d*12+snap*7,y:193-d*7},nock={x:143+d*76+snap*17,y:150+d*57},cheek={x:219,y:207};
+ const recoilHand=t<.45?sin(min(1,t/.45)*PI)*48:0,hand={x:nock.x+recoilHand,y:nock.y+recoilHand*.23};
+ r.anchors={grip,nock,upperTip:upper,lowerTip:lower,bowHand:grip,drawHand:hand,cheek};
+ const shoulder={x:-145,y:326},elbow=BowPaint.joint(shoulder,grip,218,213,-1),drawShoulder={x:330,y:328},drawElbow=BowPaint.joint(drawShoulder,hand,134,152,1);drawElbow.y-=d*27;
+ BowPaint.arm(c,shoulder,elbow,grip,71);BowPaint.arm(c,drawShoulder,drawElbow,hand,55);
+ const mat=BowPaint.gradient(c,-10,30,135,100,['#080c10','#4b5052','#191d21','#070b0e']);
+ const limb=(tip,side)=>{const gx=grip.x,gy=grip.y;BowPaint.path(c,[[gx-13,gy+side*29],[gx-5,gy+side*105,tip.x-48-d*Config.vmLimbFlex*.2,tip.y-side*24,tip.x,tip.y],[tip.x+7,tip.y+side*5],[tip.x-18,tip.y-side*24,gx+41,gy+side*96,gx+24,gy+side*16]],mat,'#080c10',3);
+  c.beginPath();c.moveTo(gx-9,gy+side*31);c.bezierCurveTo(gx,gy+side*107,tip.x-44,tip.y-side*25,tip.x,tip.y);c.strokeStyle='#a1afb1';c.lineWidth=1.5;c.stroke()};
+ limb(upper,-1);limb(lower,1);
+ BowPaint.path(c,[[grip.x-18,grip.y-37],[grip.x+2,grip.y-57,grip.x+40,grip.y-29,grip.x+25,grip.y+13],[grip.x+10,grip.y+41,grip.x-16,grip.y+33,grip.x-17,grip.y+13]],'#30383a','#080c10',4);
+ BowPaint.path(c,[[grip.x+9,grip.y-47],[grip.x+28,grip.y-66],[grip.x+48,grip.y-50],[grip.x+29,grip.y-20]],'#b94425');
+ for(let i=0;i<6;i++){c.strokeStyle=i%2?'#5a6666':'#0b1014';c.lineWidth=4;c.beginPath();c.moveTo(grip.x-17+i*3,grip.y-13+i*6);c.lineTo(grip.x+13+i*3,grip.y-28+i*6);c.stroke()}
+ BowPaint.line(c,[upper,nock,lower],'#100c0b',3);BowPaint.line(c,[upper,nock,lower],'#ca7751',1.1);
+ BowPaint.hand(c,grip.x-5,grip.y+16,-.67,1.2);
+ if(r.nocked&&(aiming||fsm.cur==='READY')){const tip={x:-24-d*6,y:-72-d*13};BowPaint.line(c,[nock,tip],'#10181f',8);BowPaint.line(c,[{x:nock.x-1,y:nock.y-2},tip],'#97aeba',4);BowPaint.line(c,[{x:nock.x-2,y:nock.y-3},{x:tip.x-1,y:tip.y}],'#d9e5e7',1);
+  BowPaint.path(c,[[tip.x-18,tip.y-30],[tip.x+10,tip.y+5],[tip.x-3,tip.y+3],[tip.x-11,tip.y+13]],'#aebbc0');BowPaint.path(c,[[nock.x-9,nock.y-39],[nock.x-27,nock.y-48],[nock.x-14,nock.y-8],[nock.x+1,nock.y+6]],'#427889')}
+ BowPaint.hand(c,hand.x+8,hand.y+10,-.4,.96)};
+Assets.fns.releaseStreak=c=>{const t=BowRig.releaseAge;if(t>=.15)return;const right=Config.handed==='right';c.globalAlpha=(1-t/.15)*.35;c.strokeStyle='#d3e2db';c.lineWidth=2;c.beginPath();c.moveTo(right?1190:90,710);c.quadraticCurveTo(right?1100:180,575,right?983:297,460);c.stroke()};
+BowRig.renderViewmodel=function(c,alpha){const right=Config.handed==='right';c.save();c.globalAlpha*=alpha;c.translate(right?1008:272,548);c.scale(right?1:-1,1);Assets.draw('bowPerspective',c,0,0,{rig:this});c.restore()};
+// ===== SPRITE VIEWMODEL (your PNG art) =====
+// Needs bow_riser.png, bow_grip_hand.png, draw_hand_hook.png, draw_hand_open.png, arrow.png in the same folder as this HTML. If any file is missing, the original drawn bow is used instead.
+// ===== LEVEL 1 (jungle camp plate) + LAYER-LOCKED COMIC RIG. Rig/HUD numbers are 1672x941 reference-image pixels (RK scales them to the 1280x720 stage). =====
+// ===== FOE v2: sprite soldiers (atlases built from the enemy .webm clips by tools/build_sprites.py) =====
+// SIDE clips (idle breathing, walk) face screen-LEFT, FRONT clips (look-around, death) face the camera. The view is picked from the guard's facing (with hysteresis); every clip change is cross-faded.
+// WALK is root-motion driven: one natural pass = START + N x LOOP + STOP. N and a tiny stride scale k are chosen per leg so the guard arrives EXACTLY on his waypoint with planted feet (no foot sliding).
+// LOOK: a sentry facing the archer holds the front pose, then plays the look-around pass; the vision cone follows the head (gaze curve baked into the meta).
+// Quality: half / quarter size mip levels (no shimmer at range), depth haze + jungle grade on the sprite only (offscreen tint pass), soft contact shadow, rim light.
+const FOE_META={"idle":{"n":58,"cols":18,"cw":112,"ch":268,"ax":63.5,"ay":262.4,"fps":15,"h":256},"walk":{"n":91,"cols":13,"cw":156,"ch":268,"ax":85.7,"ay":262.0,"fps":20,"h":256,"rm":[0.0,0.0176,0.0379,0.0605,0.0854,0.1118,0.1392,0.1672,0.1956,0.224,0.2524,0.2808,0.3092,0.3373,0.3653,0.3942,0.4244,0.4557,0.4884,0.5228,0.5579,0.5931,0.6284,0.0,0.0349,0.0697,0.1046,0.1394,0.1743,0.2091,0.244,0.2788,0.3137,0.3485,0.3834,0.4182,0.4531,0.4879,0.5228,0.5576,0.5925,0.6274,0.6622,0.6971,0.7319,0.7668,0.8016,0.8365,0.8713,0.9062,0.941,0.9759,1.0107,1.0456,1.0804,1.1153,1.1501,1.185,1.2198,1.2547,0.0,0.0357,0.0712,0.1064,0.1412,0.1755,0.2091,0.2419,0.274,0.3055,0.3366,0.3676,0.3989,0.4303,0.4617,0.4931,0.5244,0.5554,0.586,0.6159,0.645,0.673,0.6992,0.7232,0.7446,0.7622,0.776,0.7862,0.7928,0.7968,0.7979],"D":{"start":0.6639,"loop":1.2896,"stop":0.7979},"steps":[13,30,49,67,79],"v0":0.7047,"seg":{"start":[0,23],"loop":[23,60],"stop":[60,91]}},"look":{"n":68,"cols":16,"cw":124,"ch":268,"ax":59.3,"ay":263.6,"fps":15,"h":256,"gz":[32.0,31.88,31.57,31.16,30.71,30.32,30.06,29.92,28.7,26.3,23.13,19.6,16.11,13.07,10.9,10.0,8.92,5.71,1.02,-4.5,-10.18,-15.39,-19.45,-21.73,-22.14,-22.99,-24.44,-26.25,-28.21,-30.09,-31.66,-32.7,-33.0,-32.94,-32.82,-32.64,-32.42,-32.18,-31.92,-31.67,-31.44,-31.24,-31.1,-31.01,-30.91,-30.19,-29.07,-27.93,-27.15,-26.34,-21.17,-14.8,-11.98,-9.09,-3.89,-0.23,1.44,6.27,10.9,12.42,16.41,21.54,24.0,24.86,26.85,29.21,31.18,32.0]},"die":{"n":33,"cols":8,"cw":236,"ch":276,"ax":118.5,"ay":260.0,"fps":12,"h":256}};
+const hash01=n=>{const x=sin(n*12.9898+78.233)*43758.5453;return x-Math.floor(x)};
+const Foe={ready:0,hb:0,rim:.30,entry:5,rate:1.6,stop:.06,diss:.12,xf:.16,hz:.62,gr:.05,jolt:.10,turn:260,
+ M:FOE_META,GRC:[44,60,50],
+ prep(){const m=this.M.walk,f=m.fps,s=m.seg;m.a0=s.start[0];m.n0=s.start[1]-s.start[0];m.a1=s.loop[0];m.n1=s.loop[1]-s.loop[0];m.a2=s.stop[0];m.n2=s.stop[1]-s.stop[0]-1;
+  m.Ts=m.n0/f;m.Tl=m.n1/f;m.To=m.n2/f;this.M.look.Tp=(this.M.look.n-1)/this.M.look.fps},
+ // ---------- build: mip levels (1, 1/2, 1/4) of every atlas ----------
+ lvls(img,m){const L=[{img,cw:m.cw,ch:m.ch,ax:m.ax,ay:m.ay}];let src=img;
+  for(let i=1;i<3;i++){const q=document.createElement('canvas');q.width=src.width>>1;q.height=src.height>>1;const x=q.getContext('2d');x.imageSmoothingEnabled=true;x.imageSmoothingQuality='high';x.drawImage(src,0,0,q.width,q.height);L.push({img:q,cw:m.cw>>i,ch:m.ch>>i,ax:m.ax/(1<<i),ay:m.ay/(1<<i)});src=q}
+  return L},
+ init(im){const mk=(w,h)=>{const q=document.createElement('canvas');q.width=w;q.height=h;return q};
+  for(const[k,key]of[['idle','foeIdle'],['walk','foeWalk'],['look','foeLook'],['die','foeDie']])this.M[k].lv=this.lvls(im[key],this.M[k]);
+  this.A=mk(288,300);this.B=mk(288,300);this.ax=this.A.getContext('2d');this.bx=this.B.getContext('2d');
+  const q=mk(128,48),x=q.getContext('2d'),g=x.createRadialGradient(0,0,0,0,0,64);g.addColorStop(0,'rgba(0,0,0,.55)');g.addColorStop(.5,'rgba(0,0,0,.32)');g.addColorStop(1,'rgba(0,0,0,0)');
+  x.translate(64,24);x.scale(1,.375);x.fillStyle=g;x.fillRect(-64,-64,128,128);this.sh=q;this.ready=1},
+ // ---------- sim side: locomotion (20 Hz AI tick) ----------
+ rho(){return Config.patrolSpeed/AIB.ps},                                                       // playback rate of the walk (level `patrolSpeedScale`); world speed follows the clip
+ tab(a,cnt,fi,endV){const rm=this.M.walk.rm;if(fi<=0)return 0;if(fi>=cnt)return endV;const j=Math.floor(fi),u=fi-j,v0=rm[a+j],v1=j+1<cnt?rm[a+j+1]:endV;return v0+(v1-v0)*u},
+ dist(N,t){const m=this.M.walk,f=m.fps,D=m.D;                                                  // natural metres walked after t seconds of a pass with N loops
+  if(t<=m.Ts)return this.tab(m.a0,m.n0,t*f,D.start);
+  const tl=t-m.Ts;if(tl<N*m.Tl){const c=Math.floor(tl/m.Tl);return D.start+c*D.loop+this.tab(m.a1,m.n1,(tl-c*m.Tl)*f,D.loop)}
+  return D.start+N*D.loop+this.tab(m.a2,m.n2,Math.min(tl-N*m.Tl,m.To)*f,D.stop)},
+ wframe(ps,t){const m=this.M.walk,f=m.fps;let p,i,nx;                                          // atlas frame i, next frame nx, fraction (sub-frame blend)
+  if(t<m.Ts){p=t*f;i=Math.floor(p);nx=i+1}
+  else if(t-m.Ts<ps.N*m.Tl){const c=Math.floor((t-m.Ts)/m.Tl);p=m.a1+((t-m.Ts)-c*m.Tl)*f;i=Math.floor(p);nx=i+1>=m.a1+m.n1?(c===ps.N-1?m.a2:m.a1):i+1}
+  else{p=m.a2+Math.min(t-m.Ts-ps.N*m.Tl,m.To)*f;i=Math.floor(p);nx=Math.min(i+1,m.n-1)}
+  i=Math.min(i,m.n-1);return[i,Math.min(nx,m.n-1),p-Math.floor(p)]},
+ plan(x,z,L,ux,uz){const m=this.M.walk,D=m.D,fixed=D.start+D.stop,N=Math.max(0,Math.round((L-fixed)/D.loop)),k=L/(fixed+N*D.loop),ev=[];      // N whole loops + stride scale k so the pass covers exactly L metres
+  for(const idx of m.steps){if(idx<m.a1)ev.push(idx/m.fps);else if(idx<m.a2){for(let c=0;c<N;c++)ev.push(m.Ts+c*m.Tl+(idx-m.a1)/m.fps)}else ev.push(m.Ts+N*m.Tl+(idx-m.a2)/m.fps)}
+  ev.sort((a,b)=>a-b);return{t:0,pt:0,N,k,L,T:m.Ts+N*m.Tl+m.To,x0:x,z0:z,ux,uz,ev,ei:0}},
+ walk(g,h){const ps=g.ps;ps.pt=ps.t;ps.t=min(ps.T,ps.t+h*this.rho());const d=min(ps.L,this.dist(ps.N,ps.t)*ps.k);g.x=ps.x0+ps.ux*d;g.z=ps.z0+ps.uz*d;g.y=T(g.x,g.z);
+  while(ps.ei<ps.ev.length&&ps.ev[ps.ei]<=ps.t){SFX.step(g);ps.ei++}return ps.t>=ps.T},
+ arrive(g,w){g.wt=w.wait||0;g.t=0;g.ly=w.look===undefined?g.yaw:w.look*D2R;if(g.wt<=0){g.wt=-1;g.wp=(g.wp+1)%g.route.length}},
+ patrol(g,h){const C=Config,R=g.route,w=R[g.wp];                                               // replaces AI.patrol for sprite guards
+  if(g.wt>=0){g.t+=h;turnTo(g,g.ly+(g.sweepDeg||0)*D2R*sin(TAU*g.t/C.sweepPeriod),h);g.wt-=h;if(g.wt<=0){g.wt=-1;g.wp=(g.wp+1)%R.length}return}
+  if(!g.ps){const dx=w.x-g.x,dz=w.z-g.z,d=hypot(dx,dz);if(d<.1){this.arrive(g,w);return}
+   const want=atan2(dx,dz);turnTo(g,want,h);if(abs(wrapA(want-g.yaw))<.03){g.yaw=want;g.ps=this.plan(g.x,g.z,d,dx/d,dz/d)}return}   // turn first (through the front), then one natural pass
+  if(this.walk(g,h)){g.x=w.x;g.z=w.z;g.y=T(g.x,g.z);g.ps=null;this.arrive(g,w)}},
+ halt(g){g.ps=null},                                                                              // noticed something: stop where he stands
+ idleLook(g,h){const k=this.M.look;                                                               // sentry facing the archer: hold the front pose, then the look-around pass; the cone follows the gaze
+  if(!g.lw)g.lw=1.2+1.6*hash01(g.id*3+1);g.plt=g.lt;g.lt+=h;
+  if(!g.lk){if(g.lt>=g.lw){g.lk=1;g.lt=0;g.plt=0}}else if(g.lt>=k.Tp){g.lk=0;g.lt=0;g.plt=0;g.lc++;g.lw=2+2*hash01(g.id*7+g.lc*13)}
+  const p=g.lk?min(g.lt*k.fps,k.n-1):0,i=Math.floor(p),j=min(i+1,k.n-1);g.gz=k.gz[i]+(k.gz[j]-k.gz[i])*(p-i);turnTo(g,g.home-g.gz*D2R,h)},
+ // ---------- render side ----------
+ view(R,fl,bk){const a=abs(fl);if(a>.12)R.sg=fl>0?1:-1;let v=R.v;if(v==='S'){if(a<.40)v=bk<0?'F':'B'}else v=a>.60?'S':(bk<0?'F':'B');R.v=v;return v},   // S side, F front, B back (no art: side stand-in)
+ pick(e,R,T,v){const M=this.M;let m,i=0,nx=0,f=0,fl=R.sg>0,key,sx=1,sy=1;
+  if(e.ps){m=M.walk;const w=this.wframe(e.ps,lerp(e.ps.pt,e.ps.t,AI.fr));i=w[0];nx=w[1];f=w[2];key='w'+(fl?1:0)}
+  else if(v==='F'){m=M.look;if(e.look&&e.lk){const p=min(lerp(e.plt,e.lt,AI.fr)*m.fps,m.n-1);i=Math.floor(p);nx=min(i+1,m.n-1);f=p-i}else{const b=sin(T*1.7+e.ph);sy=1+.007*b;sx=1-.003*b}key='l';fl=false}      // hold = first look frame + procedural breath
+  else{m=M.idle;const p=(T+e.ph*.37)*m.fps;i=Math.floor(p)%m.n;f=p-Math.floor(p);nx=(i+1)%m.n;key='i'+(fl?1:0)}
+  return{m,i,nx,f,fl,key,sx,sy,dy:0}},
+ put(x,d,L,a){const m=d.m,g=m.lv[L],cw=g.cw,ch=g.ch,ox=144>>L,oy=280>>L;x.setTransform((d.fl?-1:1)*d.sx,0,0,d.sy,ox,oy+d.dy);
+  x.globalAlpha=a;x.drawImage(g.img,(d.i%m.cols)*cw,((d.i/m.cols)|0)*ch,cw,ch,-g.ax,-g.ay,cw,ch);
+  if(d.f>.02&&d.nx!==d.i){x.globalAlpha=a*d.f;const j=d.nx;x.drawImage(g.img,(j%m.cols)*cw,((j/m.cols)|0)*ch,cw,ch,-g.ax,-g.ay,cw,ch)}x.globalAlpha=1},   // sub-frame blend: frame i, then the next one faded in by the fraction
+ comp(list,L,Z,flash){const x=this.ax,w=288>>L,h=300>>L;x.setTransform(1,0,0,1,0,0);x.globalCompositeOperation='source-over';x.globalAlpha=1;x.clearRect(0,0,w,h);
+  for(const q of list)this.put(x,q[0],L,q[1]);
+  x.setTransform(1,0,0,1,0,0);x.globalCompositeOperation='source-atop';
+  const hz=1-exp(-Z/Config.haze),g=this.GRC;x.fillStyle='rgb('+((g[0]+(HAZE[0]-g[0])*hz)|0)+','+((g[1]+(HAZE[1]-g[1])*hz)|0)+','+((g[2]+(HAZE[2]-g[2])*hz)|0)+')';x.globalAlpha=this.gr+this.hz*hz;x.fillRect(0,0,w,h);   // haze + jungle grade, sprite pixels only
+  if(flash>0){x.fillStyle='#fff';x.globalAlpha=flash;x.fillRect(0,0,w,h)}x.globalCompositeOperation='source-over';x.globalAlpha=1},
+ blit(c,L,S,Z,a){const w=288>>L,h=300>>L,ox=144>>L,oy=280>>L,rim=this.rim*exp(-Z/Config.haze)*a;c.save();c.scale(S,S);
+  if(rim>.01){const b=this.bx;b.setTransform(1,0,0,1,0,0);b.globalCompositeOperation='copy';b.drawImage(this.A,0,0,w,h,0,0,w,h);b.globalCompositeOperation='source-in';b.fillStyle='#fff';b.fillRect(0,0,w,h);b.globalCompositeOperation='source-over';
+   const o=max(2.5/(1<<L),1/S);c.globalAlpha=rim;for(const q of[[-o,0],[o,0],[0,-o]])c.drawImage(this.B,0,0,w,h,-ox+q[0],-oy+q[1],w,h)}
+  c.globalAlpha=a;c.drawImage(this.A,0,0,w,h,-ox,-oy,w,h);c.restore();c.globalAlpha=1},
+ shadow(c,pm,k,dir,sh){const w=.95*pm*(1+sh*.9),h=.26*pm*(1+sh*.3);c.globalAlpha=k;c.drawImage(this.sh,dir*.62*pm*sh-w/2,-h/2,w,h);c.globalAlpha=1},
+ draw(c,e,sx,sy,pm,Z,fl,bk){const T=Game.time+Game.alpha*Config.step,s=1.8*pm/256,L=s<.31?2:s<.62?1:0,S=s*(1<<L),R=e.R||(e.R={v:'S',sg:1,cur:null,prev:null,x0:-9,st:-1,pop:-9,pk:0});
+  c.save();c.translate(sx,sy);if(e.alive)this.alive(c,e,R,T,L,S,pm,Z,fl,bk);else this.dead(c,e,R,T,L,S,pm,Z);c.restore()},
+ alive(c,e,R,T,L,S,pm,Z,fl,bk){const v=this.view(R,fl,bk),d=this.pick(e,R,T,v);
+  if(R.cur&&R.cur.key!==d.key){R.prev=R.cur;R.x0=T}R.cur=d;
+  let u=1;if(R.prev){u=(T-R.x0)/this.xf;if(u>=1)R.prev=null}
+  if(e.state!==R.st){if(R.st>=0){if(e.state===S_NOTICE){R.pop=T;R.pk=1}else if(e.state===S_ALARMED){R.pop=T;R.pk=1.8}}R.st=e.state}   // startle pop when he notices / raises the alarm
+  const q=exp(-(T-R.pop)*10)*R.pk;if(q>.01){d.sy*=1+.045*q;d.sx*=1-.02*q;d.dy=-6*q/(1<<L)}
+  const list=[];
+  if(R.prev){const p=R.prev,sq=1-.12*sin(PI*u)*((p.key[0]==='l')!==(d.key[0]==='l')?1:0);                // side <-> front: a quick squash reads as the body turning
+   list.push([Object.assign({},p,{sx:p.sx*sq}),min(1,2*(1-u))]);d.sx*=sq;list.push([d,min(1,2*u)])}else list.push([d,1]);
+  this.shadow(c,pm,.55,0,0);this.comp(list,L,Z,0);this.blit(c,L,S,Z,1)},
+ // ---------- death: hit-stop + white flash -> dissolve into the die clip -> fall (mirror rule) -> hold ----------
+ landT(){return this.stop+this.diss+(20-this.entry)/(this.M.die.fps*this.rate)},
+ faceRight(e){const R=e.R;return R&&R.cur?R.cur.fl:sin(e.yaw)*CB.rx+cos(e.yaw)*CB.rz>0},
+ onKill(e,a){const R=e.R,side=R&&R.cur&&R.cur.key!=='l',lat=a.vx*CB.rx+a.vz*CB.rz;       // knocked BACKWARD relative to the way he faced; a front-facing guard falls the way the arrow was travelling
+  e.fdir=side?(this.faceRight(e)?-1:1):(abs(lat)>.5?(lat>0?1:-1):(e.id&1?1:-1));e.landed=0},
+ onLand(e){const d=e.fdir||1;Particles.spawn(e.x+CB.rx*d*.8,e.y+.08,e.z+CB.rz*d*.8,14,1,1.5);SFX.thud(e)},
+ rot(e){const t0=this.stop+this.diss;return(e.fdir||1)*1.5*sstep((e.dieT-t0)/(this.landT()-t0))},   // stuck arrows ride the body down (rigid fall about the feet)
+ dead(c,e,R,T,L,S,pm,Z){const m=this.M.die,t=e.dieT,tS=this.stop,tD=tS+this.diss,dir=e.fdir||(e.fdir=this.faceRight(e)?-1:1),Mi=this.M.idle;
+  if(!R.cur)R.cur=this.pick(e,R,T,'S');
+  const jo=t<tD?this.jolt*pm*sstep((t-tS)/this.diss)*dir:this.jolt*pm*dir*(1-sstep((t-tD)/.2));
+  const sh=clamp((t-.3)/1.4,0,1);c.translate(jo,0);
+  const dd=(i,f)=>({m,i,nx:min(i+1,m.n-1),f,fl:dir>0,key:'d',sx:1,sy:1,dy:0});                              // die clip falls to screen-left natively: mirror when he must fall right
+  if(t<tD){const u=t<tS?0:sstep((t-tS)/this.diss),list=[[R.cur,u>0?min(1,2*(1-u)):1]];if(u>0)list.push([dd(this.entry,0),min(1,2*u)]);
+   this.shadow(c,pm,.55,dir,sh);this.comp(list,L,Z,.9*(1-u))}
+  else{const p=min(this.entry+(t-tS)*m.fps*this.rate,m.n-1),i=Math.floor(p);this.shadow(c,pm,.55,dir,sh);this.comp([[dd(i,p-i),1]],L,Z,0)}
+  this.blit(c,L,S,Z,1)},
+ hitbox(c,sx,sy,pm,e){c.save();c.lineWidth=2;c.strokeStyle='#ff3b3b';c.beginPath();c.arc(sx,sy-1.62*pm,.12*pm,0,6.283);c.stroke();c.strokeStyle='#ffd23b';c.strokeRect(sx-.25*pm,sy-1.46*pm,.5*pm,.78*pm);c.strokeStyle='#3bd1ff';c.strokeRect(sx-.2*pm,sy-.68*pm,.4*pm,.68*pm);
+  if(e&&e.R&&e.R.cur){const d=e.R.cur;c.fillStyle='#fff';c.font='700 12px system-ui,sans-serif';c.textAlign='center';c.fillText(d.key+' f'+d.i+(e.ps?' N'+e.ps.N+' k'+e.ps.k.toFixed(2):'')+' '+e.R.v,sx,sy+16);c.textAlign='left'}c.restore()}};
+Foe.prep();
+// ===== JUICE: sound, slow-mo kill cam, camera shake, ambient life, intro card =====
+// SFX: everything is synthesized with WebAudio (no files). Created on the first pointerdown (Breath.unlock owns the AudioContext); silently skipped when there is none. Toggle: pause menu SOUND / key N.
+const SFX={ac:null,bus:null,lp:null,nb:null,on:1,amb:0,
+ init(){if(this.ac||!Breath.ac)return;try{try{this.on=localStorage.getItem('lw_sfx')==='0'?0:1}catch(_){}
+   const ac=this.ac=Breath.ac,n=ac.sampleRate*2,b=this.nb=ac.createBuffer(1,n,ac.sampleRate),d=b.getChannelData(0);let q=7;for(let i=0;i<n;i++){q=(q*16807)%2147483647;d[i]=q/1073741823-1}
+   const lp=this.lp=ac.createBiquadFilter();lp.type='lowpass';lp.frequency.value=20000;lp.Q.value=.5;const g=this.bus=ac.createGain();g.gain.value=this.on?.9:0;g.connect(lp);lp.connect(ac.destination);this.ambience()}catch(_){this.ac=null}},
+ set(on){this.on=on?1:0;if(this.bus)this.bus.gain.setTargetAtTime(this.on?.9:0,this.ac.currentTime,.05);try{localStorage.setItem('lw_sfx',String(this.on))}catch(_){}},
+ slow(f){if(!this.lp)return;this.lp.frequency.setTargetAtTime(f<.9?900+f*9000:20000,this.ac.currentTime,.04)},       // slow-mo muffles the mix
+ out(node,p){const a=this.ac;if(a.createStereoPanner){const n=a.createStereoPanner();n.pan.value=clamp(p,-1,1);node.connect(n);n.connect(this.bus)}else node.connect(this.bus)},
+ noise(dur,g0,f0,f1,type,q,p,dl){const a=this.ac,t=a.currentTime+(dl||0),s=a.createBufferSource(),f=a.createBiquadFilter(),g=a.createGain();s.buffer=this.nb;f.type=type;f.Q.value=q;f.frequency.setValueAtTime(f0,t);f.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(g0,t+min(.006,dur*.2));g.gain.exponentialRampToValueAtTime(.0001,t+dur);s.connect(f);f.connect(g);this.out(g,p||0);s.start(t,rand()*1.1);s.stop(t+dur+.05)},
+ tone(dur,g0,f0,f1,type,p,dl){const a=this.ac,t=a.currentTime+(dl||0),o=a.createOscillator(),g=a.createGain();o.type=type||'sine';o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(g0,t+.004);g.gain.exponentialRampToValueAtTime(.0001,t+dur);o.connect(g);this.out(g,p||0);o.start(t);o.stop(t+dur+.05)},
+ sp(x,z){const d=hypot(x,z);return[1/(1+d/9),sin(atan2(x,z)-CamR.yaw)*1.4]},                                         // [volume by distance, pan by bearing]
+ can(){return this.ac&&this.on&&this.ac.state==='running'},
+ step(g){if(!this.can())return;const q=this.sp(g.x,g.z);if(q[0]<.12)return;this.noise(.075,.32*q[0],420,160,'bandpass',.9,q[1]);this.tone(.09,.22*q[0],95,48,'sine',q[1])},
+ shot(u){if(!this.can())return;this.tone(.4,.16*(.4+u),190,170,'triangle',0);this.noise(.05,.22,3000,1200,'bandpass',1,0);this.noise(.3,.10*(.5+u),2200,520,'bandpass',.8,0,.03)},
+ hit(kind,x,z){if(!this.can())return;const q=this.sp(x,z),v=q[0]*.8+.2,p=q[1];
+  if(kind==='flesh'){this.noise(.1,.40*v,1500,280,'lowpass',.7,p);this.tone(.16,.34*v,150,58,'sine',p)}
+  else if(kind==='armor'){this.tone(.55,.15*v,2350,2300,'sine',p);this.tone(.42,.10*v,3300,3240,'sine',p);this.noise(.03,.30*v,5200,2600,'highpass',.7,p)}
+  else if(kind==='tree'){this.noise(.05,.32*v,2200,900,'bandpass',2,p);this.tone(.13,.24*v,330,210,'triangle',p)}
+  else{this.noise(.13,.30*v,520,150,'lowpass',.8,p);this.tone(.1,.20*v,110,52,'sine',p)}},
+ thud(e){if(!this.can())return;const q=this.sp(e.x,e.z),v=q[0]*.8+.2;this.tone(.24,.5*v,72,34,'sine',q[1]);this.noise(.28,.24*v,380,90,'lowpass',.7,q[1])},
+ notice(g){if(!this.can())return;const p=this.sp(g.x,g.z)[1];this.tone(.11,.12,520,690,'sine',p);this.tone(.13,.10,700,900,'sine',p,.1)},
+ alarm(g){if(!this.can())return;const p=this.sp(g.x,g.z)[1];this.tone(.22,.15,660,650,'sawtooth',p);this.tone(.3,.15,440,430,'sawtooth',p,.22)},
+ ambience(){const a=this.ac;if(this.amb)return;this.amb=1;
+  const mk=(f,type,q,gv)=>{const s=a.createBufferSource(),fi=a.createBiquadFilter(),g=a.createGain();s.buffer=this.nb;s.loop=true;fi.type=type;fi.frequency.value=f;fi.Q.value=q;g.gain.value=gv;s.connect(fi);fi.connect(g);g.connect(this.bus);s.start();return g};
+  const w=mk(520,'bandpass',.35,.030);mk(5200,'highpass',.7,.009);                                                       // wind in the canopy + insects
+  const lfo=a.createOscillator(),lg=a.createGain();lfo.frequency.value=.13;lg.gain.value=.018;lfo.connect(lg);lg.connect(w.gain);lfo.start();
+  const bird=()=>{if(!this.ac)return;if(this.can()){const f=2300+rand()*1500,p=rand()*1.6-.8,n=2+(rand()*3|0);for(let i=0;i<n;i++)this.tone(.09,.035,f*(1+.06*i),f*(1.15+.06*i),'sine',p,i*.13)}setTimeout(bird,2500+rand()*6000)};setTimeout(bird,1500)}};
+// Slow-mo kill cam: at release the arrow is forecast with the SAME stepper + collide as the live one; the last ~.2 s before a kill play in slow motion, and the kill itself lingers in slow-mo.
+const lastEnemy=e=>{if(!e.target)return false;const E=Level.cur.enemies;for(let i=0;i<E.length;i++)if(E[i]!==e&&E[i].target&&E[i].alive)return false;return true};   // e is the last living target
+const Slow={f:1,rt:0,kc:null,s:{x:0,y:0,z:0,px:0,py:0,pz:0,vx:0,vy:0,vz:0,t:0,age:0},e:{wx:0,wz:0,gust:1,ex:0,ez:0},
+ reset(){this.f=1;this.rt=0;this.kc=null},
+ arm(a){this.kc=null;const s=this.s,e=this.e;for(const k of['x','y','z','px','py','pz','vx','vy','vz','t','age'])s[k]=a[k];e.wx=Level.cur.wx;e.wz=Level.cur.wz;e.gust=1;
+  for(let i=0;i<1400;i++){stepArrow(s,Config.step,e);const h=collide(s);if(h){if(h.kind===1&&h.e.alive&&h.part===1&&!armorStops(h.e,ZONE[h.part])&&lastEnemy(h.e))this.kc={T:s.age,e:h.e};return}}},   // slow-mo ONLY for a headshot on the LAST enemy
+
+ kill(){this.rt=.5},
+ update(rd){let tg=1;if(fsm.cur==='FLIGHT'&&this.kc){const ttl=this.kc.T-cur.age;if(ttl<.22&&ttl>-.05)tg=.22}if(this.rt>0){this.rt-=rd;tg=min(tg,.28)}
+  this.f+=(tg-this.f)*(1-exp(-rd*(tg<this.f?16:4)));if(abs(this.f-1)<.003)this.f=1;SFX.slow(this.f);return this.f}};
+const Shake={a:0,hit(x){this.a=max(this.a,x)},update(dt){this.a*=exp(-dt*8);if(this.a<.02)this.a=0},x(){return this.a?sin(Game.time*61)*this.a:0},y(){return this.a?cos(Game.time*53+1)*this.a:0}};
+// Ambient life: pollen / dust motes that parallax with the view and drift with the wind
+const Amb={n:44,az:new Float32Array(44),el:new Float32Array(44),dp:new Float32Array(44),ph:new Float32Array(44),g:null,
+ init(){for(let i=0;i<this.n;i++){this.az[i]=(hash01(i*1.7)-.5)*1.9;this.el[i]=(hash01(i*3.1+2)-.5)*.75-.02;this.dp[i]=.35+.65*hash01(i*5.3+1);this.ph[i]=hash01(i*7.7)*6.28}
+  const q=document.createElement('canvas');q.width=q.height=32;const x=q.getContext('2d'),r=x.createRadialGradient(16,16,0,16,16,16);r.addColorStop(0,'rgba(255,250,225,1)');r.addColorStop(.35,'rgba(255,250,225,.45)');r.addColorStop(1,'rgba(255,250,225,0)');x.fillStyle=r;x.fillRect(0,0,32,32);this.g=q},
+ update(dt){const wx=Level.cur?Level.cur.wx:0;for(let i=0;i<this.n;i++){const d=this.dp[i];this.ph[i]+=dt*(.35+.5*d);this.az[i]+=(wx*.012*d+sin(this.ph[i])*.01*d)*dt;this.el[i]+=(cos(this.ph[i]*.7)*.006-.004*d)*dt;
+   if(this.az[i]>.95)this.az[i]-=1.9;else if(this.az[i]<-.95)this.az[i]+=1.9;if(this.el[i]<-.4)this.el[i]+=.8;else if(this.el[i]>.4)this.el[i]-=.8}},
+ draw(c){if(!this.g)return;const f=CB.f;c.save();c.globalCompositeOperation='lighter';
+  for(let i=0;i<this.n;i++){const x=W/2+f*tan(this.az[i]-CamR.yaw),y=H/2-f*tan(this.el[i]-CamR.pitch);if(x<-20||x>W+20||y<-20||y>H+20)continue;const tw=.55+.45*sin(this.ph[i]*3.1),sz=(5+11*this.dp[i])*(f/989);c.globalAlpha=.34*this.dp[i]*tw;c.drawImage(this.g,x-sz,y-sz,sz*2,sz*2)}
+  c.restore()}};
+const Vign2={g:null,ga:null,gi:null,
+ ink(c){if(!this.gi){const q=c.createRadialGradient(W/2,H*.46,H*.30,W/2,H*.5,H*.98);q.addColorStop(0,'rgba(2,6,4,0)');q.addColorStop(.55,'rgba(2,6,4,.22)');q.addColorStop(1,'rgba(2,6,4,.66)');this.gi=q}c.fillStyle=this.gi;c.fillRect(0,0,W,H)},   // TEST-5: darker edges stand in for the reference's dark vine frame (no asset provides it)
+ draw(c){if(!this.g){const q=c.createRadialGradient(W/2,H/2,H*.42,W/2,H/2,H*1.0);q.addColorStop(0,'rgba(4,10,6,0)');q.addColorStop(1,'rgba(4,10,6,.34)');this.g=q;
+   const a=c.createRadialGradient(W/2,H/2,H*.30,W/2,H/2,H*.92);a.addColorStop(0,'rgba(2,6,4,0)');a.addColorStop(1,'rgba(2,6,4,.34)');this.ga=a}
+  c.fillStyle=this.g;c.fillRect(0,0,W,H);if(Level.cur.ink)this.ink(c);
+  const e=sstep(BowRig.draw);if(e<.02)return;EdgeBlur.draw(c,e);                  // aim only: gentle extra vignette fading in with the draw, then edge blur (world only: runs before sight/bow/hands)
+  c.globalAlpha=e;c.fillStyle=this.ga;c.fillRect(0,0,W,H);c.globalAlpha=1}};
+// edge blur without ctx.filter (iOS): downsample the world to tiny canvases, mask to the edges, scale back up (bilinear = blur)
+const EdgeBlur={a:null,b:null,m:null,draw(c,e){if(!this.a){const mk=(w,h)=>{const q=document.createElement('canvas');q.width=w;q.height=h;return q};this.a=mk(320,180);this.b=mk(160,90);this.m=this.b.getContext('2d');
+    const g=this.m.createRadialGradient(80,45,34,80,45,98);g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(0,0,0,1)');this.g=g}
+  const k=View.scale*View.dpr,sx=View.ox*View.dpr,sy=View.oy*View.dpr,sw=W*k,sh=H*k,x=this.a.getContext('2d'),m=this.m;
+  x.imageSmoothingEnabled=true;x.drawImage(cv,sx,sy,sw,sh,0,0,320,180);                         // world so far (stage area of the canvas) -> 320x180
+  m.globalCompositeOperation='source-over';m.imageSmoothingEnabled=true;m.clearRect(0,0,160,90);m.drawImage(this.a,0,0,320,180,0,0,160,90);   // -> 160x90
+  m.globalCompositeOperation='destination-in';m.fillStyle=this.g;m.fillRect(0,0,160,90);       // keep only the edges
+  c.save();c.globalAlpha=e*.8;c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';c.drawImage(this.b,0,0,160,90,0,0,W,H);c.restore()}};
+// Intro: fade in from black + level title card (real-time clock, never blocks input)
+const Intro={t:9,card:null,reset(L){this.t=0;this.card=L.card||null},
+ draw(c){const t=this.t;if(t>3.6)return;const fa=1-sstep(t/.9);if(fa>.002){c.fillStyle='rgba(0,0,0,'+fa.toFixed(3)+')';c.fillRect(0,0,W,H)}
+  const k=this.card;if(!k)return;const a=sstep((t-.3)/.5)*(1-sstep((t-2.6)/.8));if(a<=.01)return;
+  c.save();c.globalAlpha=a;c.textAlign='center';c.lineJoin='round';const y=H*.25-(1-sstep((t-.3)/.9))*12;
+  c.font=impact(70);c.strokeStyle='#05060a';c.lineWidth=14;c.strokeText(k[0],W/2,y);c.fillStyle='#d4101f';c.fillText(k[0],W/2,y);
+  c.font='800 26px system-ui,sans-serif';c.lineWidth=5;c.strokeText(k[1],W/2,y+42);c.fillStyle='#eee8d6';c.fillText(k[1],W/2,y+42);
+  c.font='600 19px system-ui,sans-serif';c.lineWidth=4;c.strokeText(k[2],W/2,y+74);c.fillStyle='rgba(224,218,198,.9)';c.fillText(k[2],W/2,y+74);c.restore()}};
+const NextB={x:W-262,y:H-98,w:226,h:62};
+const nextLevel=()=>Level.last>=1&&LEVELS[Level.last+1]?Level.last+1:-1;      // the NEXT button chains the test levels only (LEVEL 1 is untouched)
+function drawNext(c){if(fsm.cur!=='WON'||Game.endT<.6||nextLevel()<0)return;const b=NextB,a=sstep((Game.endT-.6)*3);c.save();c.globalAlpha=a;rr(c,b.x,b.y,b.w,b.h,12);c.fillStyle='#c4141f';c.fill();c.strokeStyle='rgba(238,232,214,.9)';c.lineWidth=2.4;c.stroke();
+ c.fillStyle='#fff';c.font='800 24px system-ui,sans-serif';c.textAlign='center';c.fillText('NEXT TEST ▶',b.x+b.w/2,b.y+39);c.textAlign='left';c.restore()}
+Amb.init();
+const Loader={ok:false,err:[],img:{},n:0,list:{plate:'assets/level1_bg_plate.jpg',plateT1:'assets/test1_bg.jpg',fgT1:'assets/test1_foliage.png',inkBg:'assets/inkaterra/inkaterra_bg_clean.jpg',inkHut:'assets/inkaterra/Inkaterra-hut.png',inkWalk:'assets/inkaterra/Inkaterra-walkway.png',propTent:'assets/camp/prop_tent.png',propTower:'assets/camp/prop_tower.png',propDrum:'assets/camp/prop_drum.png',propCrate:'assets/camp/prop_crates.png',campBg:'assets/camp/camp_bg.jpg',bow:'assets/bow_left_arm.png',hook:'assets/right_hand_hook.png',open:'assets/right_hand_open.png',arrow:'assets/arrow.png',foeIdle:'assets/soldier_breathing.webp',foeWalk:'assets/soldier_walk.webp',foeLook:'assets/soldier_look.webp',foeDie:'assets/soldier_die.webp'},
+ start(){const ks=Object.keys(this.list);for(const k of ks){const im=new Image();im.onload=()=>{this.img[k]=im;this.fin(ks.length)};im.onerror=()=>{this.err.push(this.list[k]);console.error('[assets] MISSING FILE: '+this.list[k]);this.fin(ks.length)};im.src=this.list[k]}},
+ fin(t){if(++this.n<t||this.err.length)return;Plate.init(this.img.plate,'main');Plate.init(this.img.plateT1,'t1');Plate.init(this.img.inkBg,'ink');Plate.init(this.img.campBg,'camp');Foe.init(this.img);Sprites.img=this.img;Sprites.ready=true;this.ok=true},
+ draw(){const c=ctx;c.setTransform(1,0,0,1,0,0);c.fillStyle='#000';c.fillRect(0,0,cv.width,cv.height);c.setTransform(View.scale*View.dpr,0,0,View.scale*View.dpr,View.ox*View.dpr,View.oy*View.dpr);c.textAlign='center';c.font='700 26px system-ui,sans-serif';
+  if(this.err.length){c.fillStyle='#e0455a';c.fillText('MISSING FILE'+(this.err.length>1?'S':''),W/2,H/2-30);c.font='600 20px system-ui,sans-serif';c.fillStyle='#d9d3c0';this.err.forEach((f,i)=>c.fillText(f,W/2,H/2+4+i*28))}else{c.fillStyle='#d9d3c0';c.fillText('LOADING...',W/2,H/2)}c.textAlign='left'}};
+// The plate is pinned to the camera: yaw/pitch pan it, the aim zoom scales it, so the 3D enemies stay glued to the picture. Yaw/pitch are clamped to what the plate covers (+ a sway margin).
+const Plate={on:true,pad:null,pads:{},key:'main',use(d){this.key=d.plate||'main';const r=d.aimYaw||[-.492,.457],v=d.view||{},q=d.aimPitch||[-.12,.19];this.y0=r[0];this.y1=r[1];this.s0=v.s0||H/688;this.pcx=v.pcx||716.5;this.pcy=v.pcy||344;this.p0=q[0];this.p1=q[1]},   // per-level plate: d.plate picks the pad set, d.aimYaw limits the pan to what that plate really covers
+ PL:420,PR:270,PT:200,PB:130,pcx:716.5,pcy:344,s0:H/688,y0:-.492,y1:.457,p0:-.12,p1:.19,       // pcx = plate x at yaw 0 (window x=105, tuned against the references); pads = mirror-tiled jungle so the view can sweep the whole scenario
+ side(src,s,n,st){const w=src.width,h=src.height,hz=s==='l'||s==='r',q=document.createElement('canvas');q.width=hz?w+n:w;q.height=hz?h:h+n;const x=q.getContext('2d');x.drawImage(src,s==='l'?n:0,s==='t'?n:0);
+  for(let k=0;k*st<n;k++){const sz=Math.min(st,n-k*st),mir=k%2===0;x.save();
+   if(s==='l'){const e=n-k*st;if(mir){x.translate(e,0);x.scale(-1,1);x.drawImage(src,0,0,sz,h,0,0,sz,h)}else x.drawImage(src,0,0,sz,h,e-sz,0,sz,h)}
+   else if(s==='r'){const e=w+k*st;if(mir){x.translate(e+sz,0);x.scale(-1,1);x.drawImage(src,w-sz,0,sz,h,0,0,sz,h)}else x.drawImage(src,w-sz,0,sz,h,e,0,sz,h)}
+   else if(s==='t'){const e=n-k*st;if(mir){x.translate(0,e);x.scale(1,-1);x.drawImage(src,0,0,w,sz,0,0,w,sz)}else x.drawImage(src,0,0,w,sz,0,e-sz,w,sz)}
+   else{const e=h+k*st;if(mir){x.translate(0,e+sz);x.scale(1,-1);x.drawImage(src,0,h-sz,w,sz,0,0,w,sz)}else x.drawImage(src,0,h-sz,w,sz,0,e,w,sz)}
+   x.restore()}return q},
+ soften(q){const w=q.width,h=q.height;let s=q;for(let i=0;i<4;i++){const t=document.createElement('canvas');t.width=Math.max(8,s.width>>1);t.height=Math.max(8,s.height>>1);const c=t.getContext('2d');c.imageSmoothingEnabled=true;c.drawImage(s,0,0,t.width,t.height);s=t}   // halve 4x then scale back up = cheap blur (no ctx.filter, works on iOS)
+  const B=document.createElement('canvas');B.width=w;B.height=h;const b=B.getContext('2d');b.imageSmoothingEnabled=true;b.imageSmoothingQuality='high';b.drawImage(s,0,0,w,h);const x=q.getContext('2d');
+  const reg=(x0,y0,x1,y1,gx0,gy0,gx1,gy1)=>{const T=document.createElement('canvas');T.width=w;T.height=h;const t=T.getContext('2d');t.drawImage(B,0,0);t.globalCompositeOperation='destination-in';const g=t.createLinearGradient(gx0,gy0,gx1,gy1);g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(.35,'#000');g.addColorStop(1,'#000');t.fillStyle=g;t.fillRect(x0,y0,x1-x0,y1-y0);x.drawImage(T,0,0)};
+  reg(0,0,this.PL,h,this.PL,0,0,0);reg(w-this.PR,0,w,h,w-this.PR,0,w,0);reg(0,0,w,this.PT,0,this.PT,0,0);reg(0,h-this.PB,w,h,0,h-this.PB,0,h)},
+ init(im,key){let q=document.createElement('canvas');q.width=im.width;q.height=im.height;q.getContext('2d').drawImage(im,0,0);q=this.side(q,'t',this.PT,50);q=this.side(q,'b',this.PB,50);q=this.side(q,'l',this.PL,140);q=this.side(q,'r',this.PR,140);
+  const w=q.width,h=q.height;this.soften(q);const x=q.getContext('2d'),fade=(x0,y0,x1,y1,gx0,gy0,gx1,gy1,a)=>{const g=x.createLinearGradient(gx0,gy0,gx1,gy1);g.addColorStop(0,'rgba(5,14,8,0)');g.addColorStop(1,'rgba(5,14,8,'+a+')');x.fillStyle=g;x.fillRect(x0,y0,x1-x0,y1-y0)};
+  fade(0,0,this.PL,h,this.PL,0,0,0,.5);fade(w-this.PR,0,w,h,w-this.PR,0,w,0,.5);fade(0,0,w,this.PT,0,this.PT,0,0,.3);fade(0,h-this.PB,w,h,0,h-this.PB,0,h,.3);if(key==='ink')this.grade(q);this.pads[key||'main']=q},
+ grade(q){const x=q.getContext('2d'),w=q.width,h=q.height;x.save();x.globalCompositeOperation='saturation';x.globalAlpha=.22;x.fillStyle='#808080';x.fillRect(0,0,w,h);x.restore();      // TEST-5 background only, once at init: -22% saturation, then a cool haze band behind the hut so the hut layer separates from the forest
+  const g=x.createLinearGradient(0,this.PT+300,0,this.PT+580);g.addColorStop(0,'rgba(150,166,166,0)');g.addColorStop(.45,'rgba(150,166,166,.15)');g.addColorStop(1,'rgba(150,166,166,0)');x.fillStyle=g;x.fillRect(0,this.PT+300,w,280)},   // pads fade to deep shade so the mirroring never reads
+ draw(c){const im=this.pads[this.key]||this.pads.main;if(!im)return;const f0=H/2/tan(Config.fov0*D2R/2),sP=this.s0*CB.f/f0,u=f0/this.s0,pxc=this.pcx+this.PL+u*tan(CamR.yaw),pyc=this.pcy+this.PT-u*tan(CamR.pitch);
+  c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';c.drawImage(im,W/2-pxc*sP,H/2-pyc*sP,im.width*sP,im.height*sP)}};
+Plate.xf=function(){const f0=H/2/tan(Config.fov0*D2R/2),s=this.s0*CB.f/f0,u=f0/this.s0,pxc=this.pcx+this.PL+u*tan(CamR.yaw),pyc=this.pcy+this.PT-u*tan(CamR.pitch),T=this.T||(this.T={ox:0,oy:0,s:1});T.s=s;T.ox=W/2-pxc*s+this.PL*s;T.oy=H/2-pyc*s+this.PT*s;return T};   // plate-image px -> stage px (x = T.ox + ix*T.s): same math as Plate.draw, no allocation
+const drawPlate=c=>{Plate.draw(c);if(Level.cur&&Level.cur.ink){Ink.draw(c);Ink.glue()}};   // Ink layers (TEST-5) sit right after the plate: under every enemy / cover / arrow / foliage
+// ===== TEST-5 INKATERRA CANOPY: scene layers (assets/inkaterra/*). Everything is placed in PLATE-IMAGE px (the 1672x940 composite, same space as final-reference.png), so the hut and the walkway are
+// glued to the background through pan / tilt / zoom (no parallax: the walkway's far end must stay welded to the deck). Draw order: plate -> Hut -> Walk -> enemies (items) -> Foliage -> HUD.
+// Tunables live in Ink; hut-image coords (openings, deck, guard spot) are in tools/inkaterra_openings.json.
+const Ink={hs:.41,dx:825,dy:430,doorX:797,deckY:650,        // hut scale | plate point where the door centre / deck front edge land | the same two points in hut-image px
+ ix:2.04,iy:638,                                         // interior soldier: sim x of the door centre (m) | his feet line (hut-image px, same floor as the deck)
+ gx:1176,gy:640,gz:29.5,                                   // exterior guard: standing spot on the deck (hut-image px, right of the red barrels) | his depth along the view axis (m): the sprite scale is gz-only, so he keeps his size relative to the hut
+ ws:.72,wfx:944,wfy:150,                                   // walkway scale | its far-end centre (walkway-image px); it is welded to (dx,dy), under the door
+ lay(){const o=this.L||(this.L={});o.hx=this.dx-this.doorX*this.hs;o.hy=this.dy-this.deckY*this.hs;o.wx=this.dx-this.wfx*this.ws;o.wy=this.dy-this.wfy*this.ws;return o},
+ draw(c){const T=Plate.xf();c.save();c.translate(T.ox,T.oy);c.scale(T.s,T.s);c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';Hut.draw(c);Walk.draw(c);c.restore()},
+ // The plate pans linearly (tan yaw) while proj() is rectilinear, so a world-fixed guard would drift ~6 px off the planks at the pan limits. Enemies flagged glue:1 are therefore re-placed every frame on the ray through
+ // their deck spot (plate -> stage -> inverse proj at depth gz): sprite, hitbox and arrow solver all use this ONE point (what you see is what you shoot). Moves < .2 m over the whole pan, ~.01 m at sway scale.
+ glue(){const T=Plate.xf(),sx=T.ox+(this.dx+(this.gx-this.doorX)*this.hs)*T.s,sy=T.oy+(this.dy+(this.gy-this.deckY)*this.hs)*T.s,Z=this.gz,k=Z/CB.f,X=(sx-W/2)*k,Y=(H/2-sy)*k;
+  for(const e of Level.cur.enemies)if(e.gl){const X1=X+(e.alive||!e.dd?0:e.dd*this.hs*T.s*sstep(e.dieT/Foe.landT())*k);   // dead: slides e.dd hut-px along the deck while he falls (the apron right of his spot is only ~9 px wide: the corpse would hang over the edge)
+   e.x=e.px=CamR.x+X1*CB.rx+Y*CB.ux+Z*CB.fx;e.y=CamR.y+Y*CB.uy+Z*CB.fy;e.z=e.pz=CamR.z+X1*CB.rz+Y*CB.uz+Z*CB.fz}
+  for(const e of Level.cur.enemies)if(e.inn){const hp=CB.f/Z/(this.hs*T.s),xs=e.alive?lerp(e.upx,e.ux,AI.fr):e.ux,hx=this.doorX+(xs-this.ix)*hp,   // interior soldier: sim metres -> hut px -> world point (same rule as the guard); sim x/z are kept in ux/uz
+   X2=(T.ox+(this.dx+(hx-this.doorX)*this.hs)*T.s-W/2)*k,Y2=(H/2-(T.oy+(this.dy+(this.iy-this.deckY)*this.hs)*T.s))*k;
+   e.x=e.px=CamR.x+X2*CB.rx+Y2*CB.ux+Z*CB.fx;e.y=CamR.y+Y2*CB.uy+Z*CB.fy;e.z=e.pz=CamR.z+X2*CB.rz+Y2*CB.uz+Z*CB.fz}},
+ simIn(){for(const e of Level.cur.enemies)if(e.inn){e.x=e.ux;e.z=e.uz;e.px=e.upx;e.pz=e.upz}},
+ simOut(){for(const e of Level.cur.enemies)if(e.inn){e.ux=e.x;e.uz=e.z;e.upx=e.px;e.upz=e.pz}this.glue()},
+ // does the world point (x,y,z) project inside a door / window opening? (stage px -> plate px -> hut px, same chain as Hut.draw)
+ pt(x,y,z){const dx=x-CamR.x,dy=y-CamR.y,dz=z-CamR.z,Zc=dx*CB.fx+dy*CB.fy+dz*CB.fz;if(Zc<Config.near)return false;const T=Plate.xf(),L=this.lay();   // world point -> hut px, left in this.u / this.v
+  this.u=((W/2+CB.f*(dx*CB.rx+dz*CB.rz)/Zc-T.ox)/T.s-L.hx)/this.hs;this.v=((H/2-CB.f*(dx*CB.ux+dy*CB.uy+dz*CB.uz)/Zc-T.oy)/T.s-L.hy)/this.hs;return true},
+ open(x,y,z){return this.pt(x,y,z)&&Hut.inside(this.u,this.v)},
+ // OCCLUSION PROOF: render plate + hut layers twice (soldier hidden / shown) for a camera + soldier state; returns [pixels that differ OUTSIDE the openings (must be 0), pixels that differ inside]
+ proof(yaw,pitch,fov,xs,ps,dead){const e=Level.cur.enemies.find(q=>q.inn);if(!e)return null;const mk=()=>{const q=document.createElement('canvas');q.width=W;q.height=H;return q},cs=[mk(),mk(),mk()];
+  Aim.yaw=Aim.ty=yaw;Aim.pitch=Aim.tp=pitch;Aim.sy=Aim.sp=0;Camera.snapTo();Camera.tfov=Camera.fov=fov;updateCamR(1);
+  e.ux=e.upx=xs;e.alive=!dead;e.dieT=dead||0;e.fdir=1;e.R=null;e.ps=ps!=null?Foe.plan(xs,e.uz,3,1,0):null;if(e.ps)e.ps.pt=e.ps.t=ps*e.ps.T;e.yaw=e.pyaw=ps!=null?PI/2:PI;AI.fr=0;const f0=Hut.skip;
+  for(let i=0;i<2;i++){const c=cs[i].getContext('2d');Hut.skip=i?0:1;c.fillStyle='#345';c.fillRect(0,0,W,H);Plate.draw(c);Ink.draw(c)}Hut.skip=f0;
+  const m=cs[2].getContext('2d'),T=Plate.xf();m.translate(T.ox,T.oy);m.scale(T.s,T.s);Hut.enter(m);m.fillStyle=m.strokeStyle='#fff';m.lineWidth=3;if(!Hut.P)Hut.mk();for(const q of Hut.P){m.fill(q);m.stroke(q)}m.restore();
+  const A=cs[0].getContext('2d').getImageData(0,0,W,H).data,B=cs[1].getContext('2d').getImageData(0,0,W,H).data,M=m.getImageData(0,0,W,H).data;let o=0,n=0;
+  for(let i=0;i<A.length;i+=4)if(A[i]!==B[i]||A[i+1]!==B[i+1]||A[i+2]!==B[i+2]){if(M[i+3])n++;else o++}return[o,n]}};
+const Hut={hb:[403,60,1201,1023],fade:[740,900],cv:null,
+ O:[[[775,475],[818,475],[818,607],[775,607]],[[604,508],[652,508],[677,451],[679,451],[679,539],[604,539]],[[905,451],[909,451],[935,508],[987,508],[987,539],[905,539]]],   // door glass, left window, right window (hut-image px, tools/inkaterra_openings.json): each is its OWN clip
+ over:[],skip:0,P:null,G:null,B:null,                                    // over = [x,y,w,h] sub-rects of the hut art re-drawn ON TOP of the soldier (frame / awning / sill / rail pixels that overlap an opening: none today, see HANDOFF) | skip = debug: backdrop only, no soldier (occlusion proof)
+ mk(){const g=document.createElement('canvas').getContext('2d');this.P=this.O.map(p=>{const q=new Path2D();p.forEach((v,i)=>i?q.lineTo(v[0],v[1]):q.moveTo(v[0],v[1]));q.closePath();return q});      // Path2D clips, hut-local px, built ONCE
+  this.B=this.O.map(p=>[min(...p.map(v=>v[0])),min(...p.map(v=>v[1])),max(...p.map(v=>v[0])),max(...p.map(v=>v[1]))]);
+  this.G=this.B.map(b=>{const q=g.createLinearGradient(0,b[1],0,b[3]);q.addColorStop(0,'#1c2521');q.addColorStop(1,'#070a09');return q});return this.P},                                       // dark interior backdrop, one gradient per opening
+ inside(u,v){for(const p of this.O){let k=false;for(let i=0,j=p.length-1;i<p.length;j=i++){const a=p[i],b=p[j];if((a[1]>v)!==(b[1]>v)&&u<(b[0]-a[0])*(v-a[1])/(b[1]-a[1])+a[0])k=!k}if(k)return true}return false},
+ // interior pass (hut-local space, right after the hut art): backdrop + soldier clipped to each opening; Foe.draw is the ordinary walk / idle / die code (root motion, stride, front-turn), scaled like the exterior guard (depth Ink.gz)
+ interior(c){const e=Level.cur.inn;if(!e)return;if(!this.P)this.mk();
+  for(let i=0;i<3;i++){const b=this.B[i];c.save();c.clip(this.P[i]);c.globalAlpha=.92;c.fillStyle=this.G[i];c.fillRect(b[0]-1,b[1]-1,b[2]-b[0]+2,b[3]-b[1]+2);c.globalAlpha=1;if(!this.skip&&Foe.ready)this.soldier(c,e,b);c.restore()}
+  for(const r of this.over)c.drawImage(Loader.img.inkHut,r[0],r[1],r[2],r[3],r[0],r[1],r[2],r[3])},
+ soldier(c,e,b){const T=Plate.xf(),s=Ink.hs*T.s,Z=Ink.gz,pm=CB.f/Z,hp=pm/s,al=e.alive,xs=al?lerp(e.upx,e.ux,AI.fr):e.ux,hx=Ink.doorX+(xs-Ink.ix)*hp,hy=Ink.iy;
+  if(hx+1.3*hp<b[0]||hx-1.3*hp>b[2]||hy<b[1]||hy-2.3*hp>b[3])return;                           // this opening is nowhere near him
+  const yw=al?e.pyaw+wrapA(e.yaw-e.pyaw)*AI.fr:e.yaw,fl=sin(yw)*CB.rx+cos(yw)*CB.rz,bk=sin(yw)*CB.fx+cos(yw)*CB.fz,h0=Foe.hz,g0=Foe.gr,r0=Foe.rim;if(e.gt){Foe.hz=e.gt[0];Foe.gr=e.gt[1]}Foe.rim=0;      // indoors: Foe tint / grade from e.gt, no rim light (no glow, no outline)
+  c.save();c.translate(hx,hy);c.scale(1/s,1/s);Foe.draw(c,e,0,0,pm,Z,fl,bk);if(Foe.hb&&al)Foe.hitbox(c,0,0,pm,e);c.restore();Foe.hz=h0;Foe.gr=g0;Foe.rim=r0},        // hb = opaque bbox of the hut art | the trunks run off the bottom of the PNG, so they dissolve into the jungle between hut-y fade[0] and fade[1] (cached copy; the PNG itself is untouched)
+ build(){const im=Loader.img.inkHut,b=this.hb,w=b[2]-b[0]+1,h=b[3]-b[1]+1,q=document.createElement('canvas');q.width=w;q.height=h;const x=q.getContext('2d');x.drawImage(im,b[0],b[1],w,h,0,0,w,h);
+  x.globalCompositeOperation='destination-in';const g=x.createLinearGradient(0,this.fade[0]-b[1],0,this.fade[1]-b[1]);g.addColorStop(0,'#000');g.addColorStop(1,'rgba(0,0,0,0)');x.fillStyle=g;x.fillRect(0,0,w,h);return this.cv=q},
+ enter(c){const L=Ink.lay();c.save();c.translate(L.hx,L.hy);c.scale(Ink.hs,Ink.hs)},       // hut-local space: 1 unit = 1 px of Inkaterra-hut.png (call inside Ink.draw's plate transform; the caller must c.restore())
+ draw(c){if(!Loader.img.inkHut)return;this.enter(c);c.drawImage(this.cv||this.build(),this.hb[0],this.hb[1]);if(Level.cur.inn)this.interior(c);c.restore()}};
+const Walk={sb:[151,141,1731,838],draw(c){const im=Loader.img.inkWalk;if(!im)return;const L=Ink.lay(),b=this.sb,w=b[2]-b[0]+1,h=b[3]-b[1]+1,s=Ink.ws;c.drawImage(im,b[0],b[1],w,h,L.wx+b[0]*s,L.wy+b[1]*s,w*s,h*s)}};   // walkway art already carries its own dirt, ferns and rocks: drawn once, never duplicated
+// Foreground foliage overlay (a level's `fg` key). It is a WORLD layer, not a screen sticker: it sits between the archer and the plate, so it pans / tilts / zooms with the camera exactly like the plate does
+// (CB.f px per radian) and only a touch faster (`par`: nearer = more parallax). Nothing in it is tied to the bow, the HUD or the screen centre, so turning, sway, kick and aim-zoom all move it with the scene.
+// The art is one bottom hedge strip: it is mirror-tiled sideways to cover the whole pan range, and its last rows are smeared + darkened below it so a downward tilt never shows a gap.
+const Foliage={map:{t1:'fgT1'},yr:atan2(3,42),par:1.1,sc:1.1,sink:36,ox:-80,pad:{},   // yr = rest yaw (art centred there) | par = parallax gain over the plate | sc = art scale vs the 1280 stage | sink = px the art hangs below the stage bottom at rest (keeps the guard's boots clear while aiming) | ox = px the art is slid sideways at rest (puts a low dip of the bushes under the guard) | pad = per-image bottom bleed canvas
+ build(im){const w=im.width,ph=240,q=document.createElement('canvas');q.width=w;q.height=ph;const x=q.getContext('2d');x.drawImage(im,0,im.height-3,w,3,0,0,w,ph);        // smear the last rows downward...
+  const t=document.createElement('canvas');t.width=w>>3;t.height=ph>>2;t.getContext('2d').drawImage(q,0,0,t.width,t.height);x.clearRect(0,0,w,ph);x.imageSmoothingEnabled=true;x.imageSmoothingQuality='high';x.drawImage(t,0,0,w,ph);   // ...then blur it (down + up) so no streaks read
+  const g=x.createLinearGradient(0,0,0,ph);g.addColorStop(0,'rgba(8,14,9,0)');g.addColorStop(.5,'rgba(8,14,9,.55)');g.addColorStop(1,'rgba(8,14,9,.92)');x.fillStyle=g;x.fillRect(0,0,w,ph);return q},
+ // pure layout (testable): where the art lands for a camera. Returns tile width, left x of tile 0, top y, height, zoom ratio
+ lay(im,yaw,pitch,f,f0){const zr=f/f0,s=W/im.width*this.sc*zr,w=im.width*s,h=im.height*s,dx=-f*tan(yaw-this.yr)*this.par,dy=f*tan(pitch)*this.par;
+  return{zr,w,h,x0:(W-w)/2+dx+this.ox*zr,y0:H/2+zr*(H+this.sink-im.height*W/im.width*this.sc-H/2)+dy}},       // at rest (zr 1, pitch 0) the art's bottom edge sits `sink` px below the bottom of the stage
+ draw(c){const L=Level.cur,k=L&&L.fg;if(!k)return;const im=Loader.img[this.map[k]];if(!im)return;
+  const f0=H/2/tan(Config.fov0*D2R/2),T=this.lay(im,CamR.yaw,CamR.pitch,CB.f,f0),w=T.w,h=T.h,y0=T.y0,by=y0+h,pad=this.pad[k]||(this.pad[k]=this.build(im)),ph=pad.height/im.height*h;
+  c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';
+  const i0=Math.floor((-T.x0)/w),i1=Math.floor((W-T.x0)/w);                              // tiles that touch the stage; odd ones are mirrored so every seam is continuous
+  for(let i=i0;i<=i1;i++){const tx=T.x0+i*w;c.save();if(i&1){c.translate(tx+w+.5,0);c.scale(-1,1)}else c.translate(tx-.5,0);   // .5 px overlap each side: no hairline between tiles
+   c.drawImage(im,0,y0,w+1,h);if(by<H){const dh=min(ph,H-by+2);c.drawImage(pad,0,0,pad.width,dh/ph*pad.height,0,by-1,w+1,dh)}c.restore()}}};   // bleed below the art, only when a downward tilt lifts its bottom edge off the stage
+const Sprites={ready:false,img:{},mx:0,my:0,streak:null,lastD:1,RK:W/1672,
+ T:[1712,159],B:[1318,955],P:[1250,650],N:[1560,780],N0:[1370,665],Q:[1225,505],W0:[1400,570],C:[1320,405],S:1.45,AL:430,MNT:[1238,585],     // string ends (off-frame limb tips), bow pivot, full-draw nock, rest nock, arrow aim point, wrist, pinch centre, hand scale, arrow length, sight mount
+ path(d){const N=this.N,N0=this.N0,Ns=[N0[0]+170,N0[1]+190];if(d<.15){const u=sstep(d/.15);return[Ns[0]+(N0[0]-Ns[0])*u,Ns[1]+(N0[1]-Ns[1])*u]}const u=clamp((d-.15)/.85,0,1);return[N0[0]+(N[0]-N0[0])*u,N0[1]+(N[1]-N0[1])*u]},
+ bleed(c,im){const B=70;c.drawImage(im,0,939,1672,2,0,941,1672,B);c.drawImage(im,1670,0,2,941,1672,0,B,941);c.drawImage(im,1670,939,2,2,1672,941,B,B)},   // art touches the bottom/right edges: smear the last pixel row/column outward so raising/pulling the bow never shows a gap
+ pose(T,d,aim,fat){const TP=6.283185,ph=TP*.25*T,                                   // idle: 0.25 Hz breathing, smooth (T includes the render alpha)
+  ix=sin(ph*.5+1.3)*1.1+sin(ph+.4)*.6,iy=sin(ph)*4,ir=sin(ph+.5)*.0045;           // +-4 px lift, ~1.5 px drift, ~0.26 deg tilt
+  const e=sstep(d);let x=ix*(1-e*.55),y=iy*(1-e*.55),rot=ir*(1-e*.5);
+  x+=-34*e;y+=-26*e;rot+=-.012*e;                                                  // aim pose: raised + pulled toward centre (x is in the mirrored viewmodel space, so - = centre for both hands)
+  if(aim){const f=fat||0;x+=clamp(-Aim.sy*260,-7,7)*e+sin(T*9.1)*f*.35*e;y+=clamp(Aim.sp*260,-7,7)*e+sin(T*7.3+1)*f*.3*e;   // finer hold sway: Aim.sy/sp lag, fatigue tremor
+   const sb=sin(TP*.2*T);y+=sb*1.6*e;x+=sin(TP*.2*T+1.1)*.7*e;rot+=sb*.003*e}      // slower breath on top while holding
+  return{x,y,rot}},
+ draw(c,o){const r=o.rig,d=r.draw,t=r.releaseAge,snap=r.snap||0,k=r.kick||0,lag=r.weightedAngle||0,aim=fsm.cur==='AIMING',I=this.img,RK=this.RK,left=Config.handed==='left',fat=aim?Aim.fat*1.75:0;
+  const T=Game.time+Game.alpha*Config.step,po=this.pose(T,d,aim,fat),sw=clamp(lag*.1,-.09,.09)*.4+sin(Game.time*27)*fat*.0008+sin(Game.time*1.55)*.0055*(1-d*.6)+d*.017+po.rot,P=this.P,cs=cos(sw),sn=sin(sw),R=p=>[P[0]+(p[0]-P[0])*cs-(p[1]-P[1])*sn,P[1]+(p[0]-P[0])*sn+(p[1]-P[1])*cs];
+  c.save();if(left){c.translate(W,0);c.scale(-1,1)}c.translate(po.x,po.y+k*5);c.scale(RK,RK);c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';
+  let H=null,pose=null,aA=0;
+  if(aim){this.lastD=d;if(d>.004){H=this.path(d);pose=I.hook;aA=sstep((d-.02)/.1)}}
+  else if(t<.62){const p=this.path(this.lastD),off=40*sstep(t/.1)+260*sstep((t-.1)/.5);H=[p[0]+.86*off,p[1]+.51*off];pose=I.open}
+  c.save();c.translate(P[0],P[1]);c.rotate(sw);c.translate(-P[0],-P[1]);c.drawImage(I.bow,0,0,1672,941);this.bleed(c,I.bow);c.restore();                       // bow + left arm (limbs run off-frame, so the whole layer tilts a hair)
+  const Tr=R(this.T),Br=R(this.B),M=[(Tr[0]+Br[0])/2,(Tr[1]+Br[1])/2],nx=-(Br[1]-Tr[1]),ny=Br[0]-Tr[0],nl=hypot(nx,ny)||1;let Np=M;
+  if(aim&&H)Np=H;else if(t<.9){const p0=this.path(this.lastD),e=Math.exp(-t*40);Np=[M[0]+(p0[0]-M[0])*e+nx/nl*snap*24,M[1]+(p0[1]-M[1])*e+ny/nl*snap*24]}   // released string: fast spring-back + damped vibration
+  c.lineCap='round';c.lineJoin='round';c.beginPath();c.moveTo(Tr[0],Tr[1]);c.lineTo(Np[0],Np[1]);c.lineTo(Br[0],Br[1]);c.strokeStyle='rgba(20,14,8,.55)';c.lineWidth=5.5;c.stroke();c.strokeStyle='rgba(222,190,146,.96)';c.lineWidth=3;c.stroke();
+  if(H){if(aA>0&&I.arrow){const ux=this.Q[0]-H[0],uy=this.Q[1]-H[1],a=atan2(uy,ux)-PI,sc=this.AL/1605;c.save();c.globalAlpha=aA;c.translate(H[0],H[1]);c.rotate(a);c.scale(sc,sc);c.drawImage(I.arrow,-1637,-450);c.restore()}   // arrow.png: nock end (1637,450) sits on the hand
+   const s=this.S,W0=this.W0,C=this.C,tx=H[0]-(W0[0]+s*(C[0]-W0[0])),ty=H[1]-(W0[1]+s*(C[1]-W0[1]));c.drawImage(pose,W0[0]-s*W0[0]+tx,W0[1]-s*W0[1]+ty,1672*s,941*s)}   // right hand: scale about the wrist, pinch loop lands on the nock
+  const m=R(this.MNT);this.mx=left?W-(m[0]*RK+po.x):m[0]*RK+po.x;this.my=m[1]*RK+po.y+k*5;c.restore()}};
+BowRig.renderViewmodel=function(c,alpha){if(!Sprites.ready)return;c.save();c.globalAlpha*=alpha;Sprites.draw(c,{rig:this});c.restore()};Assets.fns.releaseStreak=()=>{};
+// idle target point (the references' small "+"): shown whenever the aiming sight is not
+function drawIdleReticle(c){const f=fsm.cur,a=1-sstep(min(1,Sight.vis*3));if(a<.01||f==='WON'||f==='FAILED')return;const x=W/2,y=H/2,r0=13,r1=25;c.save();c.globalAlpha=a;c.lineCap='butt';
+ for(const q of[['rgba(8,10,8,.55)',4.4],['rgba(244,240,226,.96)',2]]){c.strokeStyle=q[0];c.lineWidth=q[1];c.beginPath();c.moveTo(x,y-r1);c.lineTo(x,y-r0);c.moveTo(x,y+r0);c.lineTo(x,y+r1);c.moveTo(x-r1,y);c.lineTo(x-r0,y);c.moveTo(x+r0,y);c.lineTo(x+r1,y);c.stroke()}c.restore()}
+// ----- HUD like the reference (stage px = reference px * .7656) -----
+const Joy={id:-1,x:0,y:0,sx:0,sy:0,cx:121,cy:575,R:79},Hud={t:{},cream:'rgba(238,232,214,.95)',dim:'rgba(10,10,10,.66)'};
+const HUDZ=[['pause',1238,44,34],['bow',1213,446,48],['hand',1215,547,44],['crouch',1215,647,44],['joy',121,575,100]];
+const hudHit=(x,y)=>{for(const q of HUDZ)if(hypot(x-q[1],y-q[2])<=q[3])return q[0];return null};
+function joyMove(e){const p=P2(e);let dx=(p.x-Joy.cx)/Joy.R,dy=(p.y-Joy.cy)/Joy.R;const m=hypot(dx,dy);if(m>1){dx/=m;dy/=m}Joy.x=abs(dx)<.1?0:dx;Joy.y=abs(dy)<.1?0:dy}
+function joyStep(dt){const f=fsm.cur;if(PM.open||(f!=='READY'&&f!=='AIMING'))return;const tx=Joy.id<0?0:Joy.x,ty=Joy.id<0?0:Joy.y,k=1-exp(-dt*9);Joy.sx+=(tx-Joy.sx)*k;Joy.sy+=(ty-Joy.sy)*k;if(abs(Joy.sx)<.002&&abs(Joy.sy)<.002)return;const cv_=v=>v*abs(v)**.8,rate=1/zoomNow();   // eased input + response curve: small push = very slow, precise aim (max ~15 deg/s)
+ Aim.ty=clamp(Aim.ty+cv_(Joy.sx)*.26*rate*dt,Plate.y0,Plate.y1);Aim.tp=clamp(Aim.tp-cv_(Joy.sy)*.17*rate*dt,Plate.p0,Plate.p1);if(f==='READY'){Aim.yaw=Aim.ty;Aim.pitch=Aim.tp}}
+function hudBtn(c,x,y,r,name,icon){const dt=performance.now()-(Hud.t[name]||-1e9),pr=dt<220?1-.1*(1-dt/220):1,on=name==='bow'&&fsm.cur==='AIMING';c.save();c.translate(x,y);c.scale(pr,pr);c.beginPath();c.arc(0,0,r,0,6.283);c.fillStyle=on?'rgba(60,18,16,.82)':Hud.dim;c.fill();c.strokeStyle=on?'rgba(255,210,190,.95)':'rgba(238,232,214,.82)';c.lineWidth=2.4;c.stroke();c.scale(r/44,r/44);c.fillStyle=Hud.cream;c.strokeStyle=Hud.cream;c.lineCap='round';c.lineJoin='round';icon(c);c.restore()}
+const iconBow=c=>{c.lineWidth=3.4;c.beginPath();c.arc(14,0,25,PI*.6,PI*1.4);c.stroke();c.lineWidth=1.6;c.beginPath();c.moveTo(6,-23.8);c.lineTo(6,23.8);c.stroke();c.lineWidth=3;c.beginPath();c.moveTo(-17,15);c.lineTo(19,-15);c.stroke();c.beginPath();c.moveTo(22,-18);c.lineTo(10,-15);c.lineTo(18,-6);c.closePath();c.fill()};
+const iconHand=c=>{c.lineWidth=5.6;for(const q of[[-9,-1,-9,-17],[-3,-2,-3,-21],[3,-2,3,-20],[9,-1,9,-15]]){c.beginPath();c.moveTo(q[0],q[1]);c.lineTo(q[2],q[3]);c.stroke()}c.beginPath();c.moveTo(-11,4);c.lineTo(-19,-4);c.stroke();rr(c,-13,-3,26,22,8);c.fill()};
+const iconCrouch=c=>{c.beginPath();c.arc(7,-17,5.6,0,6.283);c.fill();for(const q of[[7,6,-2,5,8],[-2,5,11,9,7],[11,9,3,19,6],[4,-6,-9,0,5]]){c.lineWidth=q[4];c.beginPath();c.moveTo(q[0],q[1]);c.lineTo(q[2],q[3]);c.stroke()}};
+function drawHUD2(c){
+ {const x=92,y=84,r=60;c.save();c.translate(x,y);c.beginPath();c.arc(0,0,r,0,6.283);c.fillStyle=Hud.dim;c.fill();c.strokeStyle='rgba(238,232,214,.85)';c.lineWidth=2.6;c.stroke();c.beginPath();c.arc(0,0,r-7,0,6.283);c.lineWidth=1;c.strokeStyle='rgba(238,232,214,.35)';c.stroke();
+  c.fillStyle=Hud.cream;c.font='700 15px system-ui,sans-serif';c.textAlign='center';c.textBaseline='middle';[['N',0],['E',1.5708],['S',3.1416],['W',4.7124]].forEach(q=>{const a=q[1]-CamR.yaw;c.fillText(q[0],sin(a)*r*.72,-cos(a)*r*.72)});
+  c.beginPath();c.moveTo(0,-r*.42);c.lineTo(r*.16,r*.16);c.lineTo(0,r*.04);c.lineTo(-r*.16,r*.16);c.closePath();c.fill();c.restore();c.textBaseline='alphabetic';c.textAlign='left'}
+ hudBtn(c,1238,44,22,'pause',c=>{c.lineWidth=6;c.beginPath();c.moveTo(-9,-15);c.lineTo(-9,15);c.moveTo(9,-15);c.lineTo(9,15);c.stroke()});
+ {const J=Joy;c.save();c.translate(J.cx,J.cy);c.beginPath();c.arc(0,0,J.R,0,6.283);c.fillStyle='rgba(10,10,10,.6)';c.fill();c.strokeStyle='rgba(238,232,214,.6)';c.lineWidth=2.4;c.stroke();c.fillStyle='rgba(238,232,214,.55)';
+  for(let i=0;i<4;i++){c.save();c.rotate(i*1.5708);c.beginPath();c.moveTo(0,-J.R+10);c.lineTo(7,-J.R+22);c.lineTo(-7,-J.R+22);c.closePath();c.fill();c.restore()}
+  const kx=J.x*(J.R-33),ky=J.y*(J.R-33),g=c.createRadialGradient(kx-6,ky-8,4,kx,ky,34);g.addColorStop(0,'#cfcabb');g.addColorStop(1,'#8f8b7e');c.beginPath();c.arc(kx,ky,33,0,6.283);c.fillStyle=g;c.fill();c.restore()}
+ hudBtn(c,1213,446,44,'bow',iconBow);hudBtn(c,1215,547,40,'hand',iconHand);hudBtn(c,1215,647,40,'crouch',iconCrouch);
+ if(Sight.vis>.3){const w=hudWind(),dr=w>=0?1:-1,x=W/2+Config.sightR+14,y=H/2+28;c.save();c.globalAlpha=min(1,(Sight.vis-.3)*2);c.fillStyle='#cfe8d6';c.beginPath();c.moveTo(x+dr*16,y);c.lineTo(x+dr*6,y-6);c.lineTo(x+dr*6,y-2);c.lineTo(x-dr*8,y-2);c.lineTo(x-dr*8,y+2);c.lineTo(x+dr*6,y+2);c.lineTo(x+dr*6,y+6);c.fill();c.font='700 13px system-ui,sans-serif';c.fillText(abs(w).toFixed(1)+' m/s',x+26,y+4);c.restore()}}
+function drawPause(c){c.fillStyle='rgba(0,0,0,.62)';c.fillRect(0,0,W,H);rr(c,290,236,700,362,18);c.fillStyle='rgba(12,14,12,.95)';c.fill();c.strokeStyle='rgba(238,232,214,.7)';c.lineWidth=2;c.stroke();c.textAlign='center';c.fillStyle='#eee8d6';c.font='800 34px system-ui,sans-serif';c.fillText('PAUSED',W/2,292);
+ const w=hudWind();c.font='600 18px system-ui,sans-serif';c.fillStyle='#b9c0b4';c.fillText('Wind '+abs(w).toFixed(1)+' m/s '+(w<0?'(left)':'(right)')+'   |   dev tools',W/2,334);
+ for(const b of Btns){const on=b.t===Config.sightTier||(b.id==='debug'&&AI.debug===1);rr(c,b.x,b.y,b.w,b.h,10);c.fillStyle=(b.id==='resume'||on)?'#c4141f':'rgba(34,38,34,.95)';c.fill();c.fillStyle='#fff';
+  if(b.t!==undefined){c.font='700 26px system-ui,sans-serif';c.fillText(b.t,b.x+b.w/2,b.y+35)}else if(b.id==='policy'){c.font='700 12px system-ui,sans-serif';c.fillStyle='#9aa3ad';c.fillText('MISS POLICY',b.x+b.w/2,b.y+20);c.fillStyle='#fff';c.font='700 20px system-ui,sans-serif';c.fillText(POLN[POLS.indexOf(Config.missPolicy)],b.x+b.w/2,b.y+42)}
+  else if(b.id==='debug'){c.font='700 16px system-ui,sans-serif';c.fillText('DEBUG',b.x+b.w/2,b.y+32)}else if(b.id==='resume'){c.font='800 24px system-ui,sans-serif';c.fillText('RESUME',b.x+b.w/2,b.y+37)}else{c.font='700 15px system-ui,sans-serif';c.fillText('RESTART',b.x+b.w/2,b.y+32)}}c.font='700 12px system-ui,sans-serif';c.fillStyle='#9aa3ad';c.fillText('LEVEL (temporary)   |   now: '+Level.cur.name,W/2,450);
+ for(const b of LvB){const have=b.id==='hb'||b.id==='snd'||!!LEVELS[b.lv],on=b.id==='hb'?Foe.hb===1:b.id==='snd'?SFX.on===1:b.lv===Level.last;rr(c,b.x,b.y,b.w,b.h,10);c.fillStyle=on?'#c4141f':have?'rgba(34,38,34,.95)':'rgba(24,26,24,.9)';c.fill();c.fillStyle=have?'#fff':'#5d645d';c.font='700 15px system-ui,sans-serif';c.fillText(b.id==='snd'?(SFX.on?'SOUND ON':'SOUND OFF'):b.t,b.x+b.w/2,b.y+29)}
+ c.textAlign='left'}
+const syncHold=()=>{Config.timeScale=(PM.open||PM.portrait||!Loader.ok)?0:1};
+function goFS(e){if(goFS.d||e.pointerType!=='touch')return;goFS.d=1;try{Promise.resolve(document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen()).then(()=>screen.orientation&&screen.orientation.lock&&screen.orientation.lock('landscape')).catch(()=>{})}catch(_){}}
+
+function drawHUD(c){const w=hudWind();rr(c,24,20,226,76,8);c.fillStyle='rgba(8,10,14,.8)';c.fill();
+ c.strokeStyle='#d8d8d8';c.lineWidth=3;c.beginPath();c.moveTo(46,32);c.lineTo(46,86);c.stroke();
+ const k=.6+.4*min(abs(w)/6,1),dr=w>=0?1:-1,ph=Game.time*(3+abs(w)*1.5);c.fillStyle='#c4141f';c.beginPath();c.moveTo(46,33);c.lineTo(46+dr*36*k,37+3*sin(ph));c.lineTo(46+dr*30*k,47+2*sin(ph+1));c.lineTo(46,54);c.fill();
+ c.fillStyle='#fff';c.font='700 20px system-ui,sans-serif';c.fillText('WIND',100,50);c.font='700 26px system-ui,sans-serif';c.fillText(abs(w).toFixed(1)+' m/s',100,82);
+ c.fillStyle='#d8d8d8';c.beginPath();c.moveTo(218+dr*14,60);c.lineTo(218,50);c.lineTo(218,56);c.lineTo(218-dr*14,56);c.lineTo(218-dr*14,64);c.lineTo(218,64);c.lineTo(218,70);c.fill();
+ for(const b of Btns){rr(c,b.x,b.y,b.w,b.h,8);const on=b.t===Config.sightTier||(b.id==='debug'&&AI.debug===1);c.fillStyle=on?'#c4141f':'rgba(8,10,14,.82)';c.fill();c.fillStyle='#fff';c.textAlign='center';
+  if(b.t!==undefined){c.font='700 26px system-ui,sans-serif';c.fillText(b.t,b.x+b.w/2,b.y+35)}
+  else if(b.id==='policy'){c.font='700 12px system-ui,sans-serif';c.fillStyle='#9aa3ad';c.fillText('MISS POLICY',b.x+b.w/2,b.y+20);c.fillStyle='#fff';c.font='700 20px system-ui,sans-serif';c.fillText(POLN[POLS.indexOf(Config.missPolicy)],b.x+b.w/2,b.y+42)}
+  else if(b.id==='debug'){c.font='700 16px system-ui,sans-serif';c.fillText('DEBUG',b.x+b.w/2,b.y+32)}
+  else{const cx=b.x+b.w/2,cy=b.y+b.h/2;c.strokeStyle='#fff';c.lineWidth=3.5;c.beginPath();c.arc(cx,cy,12,.6,5.4);c.stroke();c.beginPath();c.moveTo(cx+14,cy-8);c.lineTo(cx+14,cy+2);c.lineTo(cx+5,cy-2);c.fill()}}
+ c.textAlign='left'}
+// ----- comic panels: angled ink-bordered panels, halftone, crimson headline, reason line, freeze-frame (ONE offscreen canvas <= 640x360, captured once at ALARM / WON, never per frame) -----
+const Freeze={cv:null,c:null,on:0,n:0},Halftone={pat:null},PNA=[-440,-272,300,-290,330,38,-410,64],PNB=[-330,52,440,22,418,262,-352,282];
+function freezeShot(){if(!Freeze.cv){const q=document.createElement('canvas');q.width=640;q.height=360;Freeze.cv=q;Freeze.c=q.getContext('2d')}
+ const k=View.scale*View.dpr;Freeze.c.drawImage(cv,View.ox*View.dpr,View.oy*View.dpr,W*k,H*k,0,0,640,360);Freeze.on=1;Freeze.n++}      // last rendered frame, world area only
+function halftone(c){if(!Halftone.pat){const q=document.createElement('canvas');q.width=q.height=10;const x=q.getContext('2d');x.fillStyle='rgba(176,20,34,.55)';x.beginPath();x.arc(5,5,2.5,0,6.283);x.fill();Halftone.pat=c.createPattern(q,'repeat')}return Halftone.pat}
+function quadPath(c,p){c.beginPath();c.moveTo(p[0],p[1]);c.lineTo(p[2],p[3]);c.lineTo(p[4],p[5]);c.lineTo(p[6],p[7]);c.closePath()}
+function panel(c,title,sub,col,hint){c.fillStyle='rgba(0,0,0,.62)';c.fillRect(0,0,W,H);const e=sstep(Game.endT*4);c.save();c.translate(W/2,H/2-8);c.rotate(-.03);c.scale(.8+.2*e,.8+.2*e);c.globalAlpha=e;c.lineJoin='miter';
+ quadPath(c,PNA);c.fillStyle='#ece3cc';c.fill();                                                    // panel A: the freeze-frame
+ if(Freeze.on){c.save();quadPath(c,PNA);c.clip();c.drawImage(Freeze.cv,-440,-330,770,433);c.fillStyle='rgba(18,0,6,.28)';c.fillRect(-440,-330,770,433);c.globalAlpha=e*.4;c.fillStyle=halftone(c);c.fillRect(-440,-330,770,433);c.restore()}
+ c.strokeStyle='#05060a';c.lineWidth=14;quadPath(c,PNA);c.stroke();
+ quadPath(c,PNB);c.fillStyle='#ece3cc';c.fill();                                                    // panel B: headline + reason
+ c.save();c.beginPath();c.moveTo(440,22);c.lineTo(418,262);c.lineTo(100,266);c.closePath();c.clip();c.globalAlpha=e*.5;c.fillStyle=halftone(c);c.fillRect(100,22,340,250);c.restore();
+ c.strokeStyle='#05060a';c.lineWidth=14;quadPath(c,PNB);c.stroke();
+ c.textAlign='center';c.lineJoin='round';c.font=impact(72);c.strokeStyle='#05060a';c.lineWidth=14;c.strokeText(title,40,150);c.fillStyle=col;c.fillText(title,40,150);
+ c.font='700 28px system-ui,sans-serif';c.fillStyle='#14161c';c.fillText(sub,40,204);if(hint){c.font='700 18px system-ui,sans-serif';c.fillStyle='#5b6070';c.fillText(hint,40,244)}
+ c.restore();c.textAlign='left'}
+// ===== PERSPECTIVE RENDERER (pinhole projection of the 3D world; sprites are depth-scaled billboards) =====
+const CamR={x:0,y:1.6,z:0,yaw:0,pitch:0,fov:.7},CB={fx:0,fy:0,fz:1,rx:1,rz:0,ux:0,uy:1,uz:0,f:1000},PR={x:0,y:0,z:0};
+function updateCamR(a){const p=Camera.pv;for(const k of CKEYS)CamR[k]=lerp(p[k],Camera[k],a);       // interpolate between 120 Hz sim steps
+ const y=CamR.yaw,pt=CamR.pitch,cp=cos(pt);CB.fx=cp*sin(y);CB.fy=sin(pt);CB.fz=cp*cos(y);CB.rx=cos(y);CB.rz=-sin(y);CB.ux=-sin(pt)*sin(y);CB.uy=cp;CB.uz=-sin(pt)*cos(y);
+ CB.f=(H/2)/tan(CamR.fov/2)}
+function proj(x,y,z){const dx=x-CamR.x,dy=y-CamR.y,dz=z-CamR.z,Z=dx*CB.fx+dy*CB.fy+dz*CB.fz;PR.z=Z;if(Z<Config.near)return false;       // sx=W/2+f*X/Z, sy=H/2-f*Y/Z
+ PR.x=W/2+CB.f*(dx*CB.rx+dz*CB.rz)/Z;PR.y=H/2-CB.f*(dx*CB.ux+dy*CB.uy+dz*CB.uz)/Z;return true}
+// Sight line the player SEES this frame (render-interpolated camera == aim + sway). Release fires exactly along this.
+function sightUpdate(){Sight.yaw=CamR.yaw;Sight.pitch=CamR.pitch;rayRange(Sight.yaw,Sight.pitch);Sight.valid=true}
+const HAZE=[104,120,112];
+function mix(r,g,b,Z,k){const t=(1-exp(-Z/Config.haze))*(k===undefined?1:k);return'rgb('+((r+(HAZE[0]-r)*t)|0)+','+((g+(HAZE[1]-g)*t)|0)+','+((b+(HAZE[2]-b)*t)|0)+')'}   // atmospheric perspective (night fog)
+const RIM=a=>'rgba(246,236,204,'+a.toFixed(3)+')';
+
+// ----- night sky, red horizon haze, moon, mountains (angle-driven parallax) -----
+const mtn=(az,l)=>.045+.075*(.5+.5*sin(az*2.1+l*1.7))*(.6+.4*sin(az*5.3+l))+.016*sin(az*11+l*3)+l*.012;
+const MOON={az:atan2(3,42)+.31,el:.24};
+function drawSky(c){const f=CB.f,hy=H/2+f*tan(CamR.pitch);
+ const g=c.createLinearGradient(0,hy-f*.8,0,hy+2);[[0,'#050914'],[.55,'#10253a'],[.85,'#2c2d44'],[1,'#4a2a3a']].forEach(q=>g.addColorStop(q[0],q[1]));c.fillStyle=g;c.fillRect(-12,-12,W+24,H+24);
+ const da=((MOON.az-CamR.yaw+PI)%(2*PI)+2*PI)%(2*PI)-PI;
+ if(abs(da)<1.1){const mx=W/2+f*tan(da),my=H/2-f*tan(MOON.el-CamR.pitch),k=f/989,mg=c.createRadialGradient(mx,my,6*k,mx,my,150*k);mg.addColorStop(0,'rgba(190,215,235,.5)');mg.addColorStop(1,'rgba(190,215,235,0)');
+  c.fillStyle=mg;c.fillRect(mx-160*k,my-160*k,320*k,320*k);c.fillStyle='#dfe9f2';c.beginPath();c.arc(mx,my,32*k,0,6.283);c.fill();c.fillStyle='rgba(120,140,160,.14)';c.beginPath();c.arc(mx-9*k,my-5*k,9*k,0,6.283);c.arc(mx+10*k,my+9*k,6*k,0,6.283);c.fill()}
+ const hb=c.createLinearGradient(0,hy-.12*f,0,hy);hb.addColorStop(0,'rgba(170,20,35,0)');hb.addColorStop(1,'rgba(170,20,35,.17)');c.fillStyle=hb;c.fillRect(-12,hy-.12*f,W+24,.12*f+2);
+ for(let l=0;l<2;l++){c.fillStyle=l?'#0f2133':'#0b1826';c.beginPath();c.moveTo(-20,H+10);for(let sx=-20;sx<=W+20;sx+=16){const az=CamR.yaw+atan((sx-W/2)/f);c.lineTo(sx,H/2-f*tan(mtn(az,l)-CamR.pitch))}c.lineTo(W+20,H+10);c.fill()}
+ c.fillStyle=mix(6,10,14,170);c.fillRect(-12,clamp(hy,0,H),W+24,H)}
+
+// ----- terrain as depth slices (far->near) with billboards merged in by depth -----
+const NS=60,SM=36,ZD=Array.from({length:NS},(_,i)=>2.5*Math.pow(60,1-i/(NS-1)));   // 150 m ... 2.5 m, geometric
+function fillSlice(c,zw,i){const dz=zw-CamR.z,f=CB.f,v=1+.045*sin(i*1.9)+.03*sin(i*4.7);c.fillStyle=mix(5*v,9*v,13*v,dz);c.beginPath();let fx=0,lx=0;
+ for(let j=0;j<=SM;j++){const sx=-40+(W+80)*j/SM,az=clamp(CamR.yaw+atan((sx-W/2)/f),-1.45,1.45),x=CamR.x+dz*tan(az),ok=proj(x,T(x,zw),zw),px=ok?PR.x:sx,py=ok?PR.y:H+80;
+  if(j){c.lineTo(px,py)}else{c.moveTo(px,py);fx=px}lx=px}
+ c.lineTo(lx,H+120);c.lineTo(fx,H+120);c.fill()}
+function roadQuad(c,zf,zn){const hw=2,xf=roadX(zf),xn=roadX(zn);if(!proj(xf-hw,T(xf-hw,zf),zf))return;const a=PR.x,b=PR.y;if(!proj(xf+hw,T(xf+hw,zf),zf))return;const c1=PR.x,d1=PR.y;
+ if(!proj(xn+hw,T(xn+hw,zn),zn))return;const e=PR.x,g=PR.y;if(!proj(xn-hw,T(xn-hw,zn),zn))return;
+ c.fillStyle=mix(13,16,21,(zf+zn)/2-CamR.z);c.beginPath();c.moveTo(a,b);c.lineTo(c1,d1);c.lineTo(e,g);c.lineTo(PR.x,PR.y);c.fill()}
+const ITEMS=[];
+function buildItems(){ITEMS.length=0;const L=Level.cur;for(const q of FG)ITEMS.push({z:q.z,k:3,o:q});for(const t of L.trees)ITEMS.push({z:t.z,k:0,o:t});for(const e of L.enemies)ITEMS.push({z:e.z,k:1,o:e});for(const v of L.cover)ITEMS.push({z:v.z,k:4,o:v});for(const a of Arrows)if(a.on&&a.stuck)ITEMS.push({z:a.hz,k:2,o:a});ITEMS.sort((p,q)=>q.z-p.z)}
+function drawGround(c){let ip=0;
+ for(let i=0;i<NS;i++){const zi=CamR.z+ZD[i];if(!Plate.on)fillSlice(c,zi,i);const zn=i<NS-1?CamR.z+ZD[i+1]:-1e9;if(i<NS-1&&!Plate.on)roadQuad(c,zi,zn);
+  while(ip<ITEMS.length&&ITEMS[ip].z>zn){const it=ITEMS[ip++];if(it.k===0){if(!Plate.on)drawTree(c,it.o)}else if(it.k===1)drawEnemy(c,it.o);else if(it.k===3){if(!Plate.on)drawFlora(c,it.o)}else if(it.k===4)drawCover(c,it.o);else drawArrow3(c,it.o,1)}}}
+
+// ----- billboards: black-teal silhouettes with a pale rim light (night-jungle look) -----
+function drawTree(c,t){if(!proj(t.x,t.y,t.z))return;const Z=PR.z,pm=CB.f/Z,sx=PR.x,sy=PR.y;if(sx<-400||sx>W+400||t.h*pm<6)return;
+ const rim=.42*exp(-Z/Config.haze),lw=max(1,.03*pm);
+ c.fillStyle=mix(8,16,24,Z);c.beginPath();c.moveTo(sx-.3*pm,sy);c.lineTo(sx-.16*pm,sy-t.h*.6*pm);c.lineTo(sx+.16*pm,sy-t.h*.6*pm);c.lineTo(sx+.3*pm,sy);c.fill();
+ const k=t.h/10;
+ if(t.type===0){const cols=[[7,17,26],[10,22,32],[5,13,20]];for(let i=0;i<16;i++){const q=cols[i%3],a=i*2.4+t.seed,fy=.42+.58*((i*37%16)/16),ox=sin(a)*2.7*k*(1.1-fy*.5),r=(1.5+.7*sin(i*1.3+t.seed))*k;c.fillStyle=mix(q[0],q[1],q[2],Z);c.beginPath();c.arc(sx+ox*pm,sy-fy*t.h*pm,r*pm,0,6.283);c.fill();
+   if(fy>.7){c.strokeStyle=RIM(rim);c.lineWidth=lw;c.beginPath();c.arc(sx+ox*pm,sy-fy*t.h*pm,r*pm,-1.2,.1);c.stroke()}}}
+ else{for(let i=0;i<6;i++){const y0=sy-(t.h*.18+i*t.h*.14)*pm,w=(2.4-i*.36)*k*pm;c.fillStyle=i%2?mix(8,19,27,Z):mix(5,13,20,Z);c.beginPath();c.moveTo(sx-w,y0);c.lineTo(sx+w,y0);c.lineTo(sx,y0-t.h*.26*pm);c.fill();
+   c.strokeStyle=RIM(rim);c.lineWidth=lw;c.beginPath();c.moveTo(sx,y0-t.h*.26*pm);c.lineTo(sx+w,y0);c.stroke()}}}
+function guardArt(c,Z){const K=.45,m=(r,g,b)=>mix(r,g,b,Z,K),body=m(2,3,5),rim=RIM(.42*exp(-Z/Config.haze));
+ c.fillStyle=body;c.fillRect(-9,-30,7,30);c.fillRect(2,-30,7,30);c.fillRect(-14,-58,28,30);
+ c.beginPath();c.arc(0,-68,10.5,0,6.283);c.fill();c.beginPath();c.arc(0,-70,12,PI,0);c.fill();c.fillRect(-12,-71,24,3);
+ c.strokeStyle=body;c.lineWidth=4;c.lineCap='round';c.beginPath();c.moveTo(-12,-46);c.lineTo(24,-58);c.stroke();
+ c.fillStyle=m(179,18,29);c.fillRect(-14,-52,5,9);c.fillRect(-7,-60,14,3);
+ c.strokeStyle=rim;c.lineWidth=1.3;c.beginPath();c.moveTo(-14,-58);c.lineTo(14,-58);c.moveTo(10.5,-68);c.arc(0,-68,10.5,-.9,.2);c.stroke()}
+function drawEnemy(c,e){if(e.inn||e.dorm)return;const al=e.alive,gx=al?lerp(e.px,e.x,AI.fr):e.x,gz=al?lerp(e.pz,e.z,AI.fr):e.z;if(!proj(gx,al&&!e.fy?T(gx,gz):e.y,gz))return;const Z=PR.z,pm=CB.f/Z,sx=PR.x,sy=PR.y,s=1.8*pm/82;if(sx<-200||sx>W+200)return;
+ const yw=e.look&&e.state===S_IDLE?e.home:al?e.pyaw+wrapA(e.yaw-e.pyaw)*AI.fr:e.yaw,fl=sin(yw)*CB.rx+cos(yw)*CB.rz,bk=sin(yw)*CB.fx+cos(yw)*CB.fz;       // fl: facing left/right on screen, bk: facing away from the camera
+ if(e.skin==='soldier'&&Foe.ready){const h0=Foe.hz,g0=Foe.gr;const tc=e.hvk==='tent'?Prop.clipIn(c,e):0,r0=Foe.rim;if(e.gt){Foe.hz=e.gt[0];Foe.gr=e.gt[1]}if(tc&&e.gt[1]>.2)Foe.rim=0;Foe.draw(c,e,sx,sy,pm,Z,fl,bk);Foe.hz=h0;Foe.gr=g0;Foe.rim=r0;if(Foe.hb&&al)Foe.hitbox(c,sx,sy,pm,e);if(tc){c.restore();Prop.over(c,e)}}   // hg:[haze,grade] = per-enemy override of Foe.hz / Foe.gr (TEST-5 guard)
+ else{c.save();c.translate(sx,sy);c.scale(al&&fl<0?-s:s,s);if(!al)c.rotate(sstep(e.dieT/.55)*1.45);guardArt(c,Z);if(e.armor.deflect.length)armorArt(c,Z);if(al)visorSlit(c,abs(fl),bk,Z);c.restore();}
+ let top=sy-2.3*pm;
+ if(al&&Config.markers&&e.target){const m=clamp(.3*pm,6,13),y=sy-2.3*pm-m-3+sin(Game.time*4+e.x)*2;c.fillStyle='#d4101f';c.beginPath();c.moveTo(sx-m*.7,y-m);c.lineTo(sx+m*.7,y-m);c.lineTo(sx,y);c.closePath();c.fill();top=y-m}
+ if(al&&e.meter>0&&AI.al!==e)drawNoticeMark(c,sx,top-6,clamp(pm*.5,18,64),e.meter);
+ if(AI.al===e)drawAlarmMark(c,sx,sy,pm)}
+function visorSlit(c,side,bk,Z){if(bk>.35)return;c.fillStyle=mix(150,215,235,Z,.55);c.fillRect(side*8-(1.5+(1-side)*5),-70,3+(1-side)*10,2.4)}      // placeholder art: pale visor slit on the facing side (hidden when his back is to us)
+const IMP=[],impact=z=>{z|=0;return IMP[z]||(IMP[z]='italic 900 '+z+'px Impact,"Arial Black",sans-serif')};      // memoised font strings: no per-frame string building
+function armorArt(c,Z){c.fillStyle=mix(58,70,84,Z,.45);c.fillRect(-17,-62,9,7);c.fillRect(8,-62,9,7);c.fillRect(-13,-57,26,12);c.fillRect(-9,-31,7,14);c.fillRect(2,-31,7,14);c.fillStyle=mix(150,170,190,Z,.45);c.fillRect(-1.5,-82,3,9)}      // placeholder plates: pauldrons, breastplate, greaves, helm crest
+// ----- detection HUD: crimson "!" meter over noticing guards, edge chevron toward off-screen ones, red vignette pulse while a meter fills -----
+function drawNoticeMark(c,x,y,z,m){c.save();c.textAlign='center';c.lineJoin='round';c.font=impact(z);c.strokeStyle='#05060a';c.lineWidth=z*.22;c.strokeText('!',x,y);c.fillStyle='rgba(70,12,18,.92)';c.fillText('!',x,y);
+ c.beginPath();c.rect(x-z,y-z*.8*m,2*z,z*.8*m+3);c.clip();c.fillStyle='#e01626';c.fillText('!',x,y);c.restore()}                       // the glyph fills crimson from the bottom as the meter rises
+function noticeSide(g){const hf=atan(tan(CamR.fov/2)*W/H),rel=wrapA(atan2(g.x-CamR.x,g.z-CamR.z)-CamR.yaw);return abs(rel)<=hf*.94?0:rel>0?1:-1}      // 0 = inside the horizontal FOV, +-1 = off-screen right / left
+const Vig={g:null};
+function drawDetectHUD(c){const E=Level.cur.enemies;
+ for(let i=0;i<E.length;i++){const g=E[i];if(!g.alive||g.meter<=0||g.state===S_ALARMED)continue;const s=noticeSide(g);if(!s)continue;const k=14+16*g.meter;
+  c.save();c.globalAlpha=.55+.45*sin(Game.time*10);c.translate(s>0?W-34:34,H*.42);c.scale(s,1);c.lineCap='round';c.lineJoin='round';
+  c.beginPath();c.moveTo(-k*.6,-k);c.lineTo(k*.6,0);c.lineTo(-k*.6,k);c.strokeStyle='#05060a';c.lineWidth=11;c.stroke();c.strokeStyle='#e01626';c.lineWidth=6;c.stroke();c.restore()}
+ if(AI.vig>.01){if(!Vig.g){const q=c.createRadialGradient(W/2,H/2,H*.38,W/2,H/2,H*.95);q.addColorStop(0,'rgba(200,16,30,0)');q.addColorStop(1,'rgba(200,16,30,.55)');Vig.g=q}      // gradient cached once
+  c.save();c.globalAlpha=clamp(AI.vig,0,1)*(.55+.45*sin(Game.time*9));c.fillStyle=Vig.g;c.fillRect(0,0,W,H);c.restore()}}
+function drawAlarmMark(c,sx,sy,pm){const a=fsm.cur==='ALARM'?sstep(fsm.st.ALARM.t*9):1,z=clamp(pm*1.1,26,110)*(.6+.4*a);
+ c.save();c.globalAlpha=a;c.textAlign='center';c.lineJoin='round';c.font=impact(z);c.strokeStyle='#05060a';c.lineWidth=z*.2;c.strokeText('!',sx,sy-2.5*pm-z*.2);c.fillStyle='#d4101f';c.fillText('!',sx,sy-2.5*pm-z*.2);c.restore()}
+// ----- cover: bush / rock / wall silhouettes (placeholder art, depth-sorted with trees) -----
+const BUSHC=[[34,68,38],[44,84,46],[26,56,32]];
+function wallFace(c,xa,za,xb,zb,h,col,rim){const ya=T(xa,za),yb=T(xb,zb);if(!proj(xa,ya,za)||PR.z<.5)return;const ax=PR.x,ay=PR.y;if(!proj(xb,yb,zb)||PR.z<.5)return;const bx=PR.x,by=PR.y;if(!proj(xb,yb+h,zb)||PR.z<.5)return;const cx=PR.x,cy=PR.y;if(!proj(xa,ya+h,za)||PR.z<.5)return;      // all corners clear of the near plane (no smeared quads)
+ 
+ c.fillStyle=col;c.beginPath();c.moveTo(ax,ay);c.lineTo(bx,by);c.lineTo(cx,cy);c.lineTo(PR.x,PR.y);c.closePath();c.fill();c.strokeStyle=rim;c.lineWidth=1.2;c.beginPath();c.moveTo(PR.x,PR.y);c.lineTo(cx,cy);c.stroke()}
+// ===== TEST-2 CAMP PROPS (assets/camp/*.png, numbers from LoneWolf-Props props.json). A prop is a `cover` entry: (x,y,z) = its ground anchor, size from ppm (png px per metre). It is a flat billboard sorted with the enemies;
+// sol:1 = arrows stop on its box (collide), every box also blocks sight (coverBlocks). Door / gap polygons are in prop-png px.
+const PROP={tent:{img:'propTent',w:497,h:300,ax:237,ay:252,ppm:71,fp:[240,252,238,36],door:[[335,112],[398,112],[400,247],[341,247]],doorR:399,win:[[66,127,112,170],[165,135,220,172]],over:[[329,93,76,21],[385,110,10,26]]},
+ tower:{img:'propTower',w:258,h:371,ax:137,ay:358,ppm:62,fp:[130,345,95,16],gaps:[[48,76,112,126],[154,86,212,119]]},
+ drum:{img:'propDrum',w:171,h:289,ax:85,ay:288,ppm:328,fp:[85,283,70,14]},
+ crate:{img:'propCrate',w:434,h:239,ax:250,ay:222,ppm:140,fp:[215,205,230,28]}};
+const Prop={
+ baked(v,P,Z){if(v.cv)return v.cv;const im=Loader.img[P.img],q=document.createElement('canvas');q.width=P.w;q.height=P.h;const x=q.getContext('2d');x.drawImage(im,0,0);
+  x.globalCompositeOperation='source-atop';x.fillStyle='rgba(128,146,142,'+clamp(.05+(Z-8)*.011,.05,.34).toFixed(3)+')';x.fillRect(0,0,P.w,P.h);return v.cv=q},      // cached once per prop: cool depth haze so it sits in the plate's air (no per-frame pixel work)
+ draw(c,v){const P=PROP[v.pr.t];if(!Loader.img[P.img]||!proj(v.x,v.y,v.z))return;const Z=PR.z,k=CB.f/Z/P.ppm,sx=PR.x,sy=PR.y,m=v.pr.m?-1:1;if(sx<-900||sx>W+900)return;
+  c.save();c.translate(sx,sy);c.scale(m*k,k);const f=P.fp;c.fillStyle='rgba(18,11,6,'+(v.pr.t==='tent'?.42:.30)+')';c.beginPath();c.ellipse(m*(f[0]-P.ax),f[1]-P.ay,f[2],f[3],0,0,6.283);c.fill();     // contact shadow
+  c.imageSmoothingEnabled=true;c.imageSmoothingQuality='high';c.drawImage(this.baked(v,P,Z),-P.ax,-P.ay);c.restore()},
+ // enemy A (tent walker): visible only inside the door polygon, or anywhere right of the door's right edge (= outside the tent). Tint fades from dark interior to normal as he steps out.
+ clipIn(c,e){const v=e.pv,P=PROP.tent;if(!v||!proj(v.x,v.y,v.z))return 0;const sx=PR.x,sy=PR.y,k=CB.f/PR.z/P.ppm,d=P.door;c.save();c.beginPath();
+  for(let i=0;i<4;i++){const X=sx+(d[i][0]-P.ax)*k,Y=sy+(d[i][1]-P.ay)*k;i?c.lineTo(X,Y):c.moveTo(X,Y)}c.closePath();for(const r of P.win)c.rect(sx+(r[0]-P.ax)*k,sy+(r[1]-P.ay)*k,(r[2]-r[0])*k,(r[3]-r[1])*k);c.rect(sx+(P.doorR-P.ax)*k,-60,W+500,H+300);c.clip();
+  const g=sstep((e.x-v.x-1.9)/1.0),a=e.gtA||(e.gtA=[0,0]);a[0]=lerp(.5,.62,g);a[1]=lerp(.34,.05,g);e.gt=a;return 1},
+ over(c,e){const v=e.pv,P=PROP.tent;if(!v||!proj(v.x,v.y,v.z))return;const sx=PR.x,sy=PR.y,k=CB.f/PR.z/P.ppm,im=this.baked(v,P,PR.z);   // door roll + tassel are redrawn over him
+  c.save();c.translate(sx,sy);c.scale(k,k);for(const r of P.over)c.drawImage(im,r[0],r[1],r[2],r[3],r[0]-P.ax,r[1]-P.ay,r[2],r[3]);c.restore()},
+ // arrow hit validity: tent walker = inside the door polygon (or outside the tent); tower sentry = only his head / shoulders in the two gaps under the roof. Else the arrow stops in the wall.
+ hit(e,x,y,z){const v=e.pv;if(!v||!proj(x,y,z))return true;const hx=PR.x,hy=PR.y;if(!proj(v.x,v.y,v.z))return true;const P=PROP[v.pr.t],k=CB.f/PR.z/P.ppm,u=(hx-PR.x)/k+P.ax,w=(hy-PR.y)/k+P.ay,sl=4;
+  if(e.hvk==='tent'){if(u>P.doorR||(u>335-sl&&u<400+sl&&w>112-sl&&w<247+sl))return true;for(const r of P.win)if(u>r[0]&&u<r[2]&&w>r[1]&&w<r[3])return true;return false}
+  for(const g of P.gaps)if(u>g[0]-sl&&u<g[2]+sl&&w>g[1]-sl&&w<g[3]+sl)return true;return false}};
+function drawCover(c,v){if(v.pr)return Prop.draw(c,v);if(!proj(v.x,v.y,v.z))return;const Z=PR.z,pm=CB.f/Z,sx=PR.x,sy=PR.y;if(sx<-700||sx>W+700)return;const rim=RIM(.4*exp(-Z/Config.haze));
+ if(v.w>0){const x0=v.x-v.w/2,x1=v.x+v.w/2,z0=v.z-v.d/2,z1=v.z+v.d/2;
+  if(CamR.x<x0)wallFace(c,x0,z0,x0,z1,v.h,mix(66,56,42,Z),rim);else if(CamR.x>x1)wallFace(c,x1,z0,x1,z1,v.h,mix(66,56,42,Z),rim);       // visible side face
+  wallFace(c,x0,z0,x1,z0,v.h,mix(92,78,56,Z),rim)}                                                                                    // front face
+ else if(v.k==='rock'){c.fillStyle=mix(98,100,90,Z);c.beginPath();for(let i=0;i<8;i++){const a=i/8*TAU,rd=v.r*(.85+.2*sin(v.seed*3.1+i*2.3)),px=sx+cos(a)*rd*pm,py=sy-(.5+.5*sin(a))*v.h*pm*(.9+.15*sin(i*1.7+v.seed));i?c.lineTo(px,py):c.moveTo(px,py)}c.closePath();c.fill();
+  c.strokeStyle=rim;c.lineWidth=max(1,.025*pm);c.beginPath();c.moveTo(sx-v.r*.7*pm,sy-v.h*.7*pm);c.lineTo(sx+v.r*.1*pm,sy-v.h*.95*pm);c.stroke()}
+ else{for(let i=0;i<12;i++){const q=BUSHC[i%3],a=i*2.4+v.seed,fy=.25+.7*((i*37%12)/12),ox=sin(a)*v.r*(1-fy*.4),r=v.r*(.42+.12*sin(i*1.3+v.seed));c.fillStyle=mix(q[0],q[1],q[2],Z);c.beginPath();c.arc(sx+ox*pm,sy-fy*v.h*pm,r*pm,0,6.283);c.fill();
+   if(fy>.6){c.strokeStyle=rim;c.lineWidth=max(1,.025*pm);c.beginPath();c.arc(sx+ox*pm,sy-fy*v.h*pm,r*pm,-1.2,.1);c.stroke()}}}}
+
+// ----- foreground flora (real 3D positions 3-7 m from the eye): ferns + bush, near-black with rim light -----
+const FG=[{k:'fern',x:-1.7,z:3.0,s:1},{k:'fern',x:2.4,z:3.4,s:1.1},{k:'fern',x:-3.6,z:4.6,s:.9},{k:'bush',x:-4.6,z:6.2,s:1}];
+function drawFlora(c,q){const y=T(q.x,q.z);if(!proj(q.x,y,q.z))return;const Z=PR.z,pm=CB.f/Z,sx=PR.x,sy=PR.y;if(sx<-500||sx>W+500)return;const rim=RIM(.4*exp(-Z/Config.haze));
+ c.save();c.translate(sx,sy);
+ if(q.k==='fern'){const u=pm*q.s/110;c.scale(u,u);for(let i=0;i<9;i++){c.save();c.rotate(-1.3+i*.32);const h=120+i%3*20;c.fillStyle=mix(1,2,3,Z);c.beginPath();c.moveTo(0,0);c.quadraticCurveTo(14,-60,0,-h);c.quadraticCurveTo(-12,-60,0,0);c.fill();
+   c.strokeStyle=rim;c.lineWidth=1.4/u*(u>.5?.5:1);c.beginPath();c.moveTo(0,0);c.quadraticCurveTo(14,-60,0,-h);c.stroke();c.restore()}}
+ else{const u=pm*q.s/80;c.scale(u,u);for(let k=0;k<2;k++){c.fillStyle=k?mix(2,5,7,Z):mix(11,29,24,Z);for(let i=0;i<24;i++){c.beginPath();c.ellipse(sin(i*12.9)*78,-abs(cos(i*7.1))*58-(k?0:3),20+10*abs(sin(i*3.3)),16+6*abs(cos(i*2.1)),sin(i)*.6,0,6.283);c.fill();
+   if(k&&i%3===0){c.strokeStyle=rim;c.lineWidth=1.2;c.beginPath();c.ellipse(sin(i*12.9)*78,-abs(cos(i*7.1))*58,20+10*abs(sin(i*3.3)),16+6*abs(cos(i*2.1)),sin(i)*.6,-2.2,-.9);c.stroke()}}}}
+ c.restore()}
+
+// ----- arrows: true 3D segment tail->tip, foreshortened by perspective -----
+const AT={tx:0,ty:0,tz:0,ax:0,ay:0,az:0,dx:0,dy:0,dz:1},ROT=[0,0,0];
+function rotView(x,y,z,th){const X=x*CB.rx+z*CB.rz,Y=x*CB.ux+y*CB.uy+z*CB.uz,Zc=x*CB.fx+y*CB.fy+z*CB.fz,sx=X,sy=-Y,cs=cos(th),sn=sin(th),nx=sx*cs-sy*sn,ny=sx*sn+sy*cs,X2=nx,Y2=-ny;   // rotate in the billboard plane (about the view axis)
+ ROT[0]=CB.rx*X2+CB.ux*Y2+CB.fx*Zc;ROT[1]=CB.uy*Y2+CB.fy*Zc;ROT[2]=CB.rz*X2+CB.uz*Y2+CB.fz*Zc}
+function arrowEnds(a,al){let tx,ty,tz,dx,dy,dz;
+ if(!a.stuck){tx=lerp(a.px,a.x,al);ty=lerp(a.py,a.y,al);tz=lerp(a.pz,a.z,al);const v=hypot(a.vx,a.vy,a.vz)||1;dx=a.vx/v;dy=a.vy/v;dz=a.vz/v}
+ else{let ox=a.hx,oy=a.hy,oz=a.hz;dx=a.dx;dy=a.dy;dz=a.dz;
+  if(a.att){const e=a.att,th=e.alive?0:(e.skin==='soldier'&&Foe.ready?Foe.rot(e):sstep(e.dieT/.55)*1.45);rotView(a.ox,a.oy,a.oz,th);ox=e.x+ROT[0];oy=e.y+ROT[1];oz=e.z+ROT[2];rotView(dx,dy,dz,th);dx=ROT[0];dy=ROT[1];dz=ROT[2]}
+  tx=ox+dx*a.embed;ty=oy+dy*a.embed;tz=oz+dz*a.embed}
+ AT.tx=tx;AT.ty=ty;AT.tz=tz;AT.dx=dx;AT.dy=dy;AT.dz=dz;AT.ax=tx-dx*Config.arrowLen;AT.ay=ty-dy*Config.arrowLen;AT.az=tz-dz*Config.arrowLen}
+const depthOf=(x,y,z)=>(x-CamR.x)*CB.fx+(y-CamR.y)*CB.fy+(z-CamR.z)*CB.fz;
+function seg(c,x0,y0,x1,y1,col,w){c.strokeStyle=col;c.lineWidth=w;c.beginPath();c.moveTo(x0,y0);c.lineTo(x1,y1);c.stroke()}
+function drawArrow3(c,a,al){arrowEnds(a,al);let ax=AT.ax,ay=AT.ay,az=AT.az;const tx=AT.tx,ty=AT.ty,tz=AT.tz,dx=AT.dx,dy=AT.dy,dz=AT.dz;
+ const Zt=depthOf(ax,ay,az),Zp=depthOf(tx,ty,tz);if(Zp<Config.near+.02)return;
+ if(Zt<Config.near+.01){const u=(Config.near+.02-Zt)/(Zp-Zt);ax=lerp(ax,tx,u);ay=lerp(ay,ty,u);az=lerp(az,tz,u)}
+ if(!proj(ax,ay,az))return;const x0=PR.x,y0=PR.y;if(!proj(ax+dx*.16,ay+dy*.16,az+dz*.16))return;const x1=PR.x,y1=PR.y;
+ if(!proj(tx-dx*.07,ty-dy*.07,tz-dz*.07))return;const x2=PR.x,y2=PR.y;if(!proj(tx,ty,tz))return;const x3=PR.x,y3=PR.y,pm=CB.f/PR.z,sh=max(1.5,.011*pm);
+ c.lineCap='round';seg(c,x0,y0,x3,y3,'#1a140e',sh+2);seg(c,x0,y0,x2,y2,'#e6dcc0',sh);seg(c,x0,y0,x1,y1,'#c42a35',sh*2.2);seg(c,x2,y2,x3,y3,'#b4bec8',sh*1.5)}
+function drawTrail(c,a){if(a.tn<2)return;c.strokeStyle='rgba(255,255,255,.35)';c.lineWidth=1.3;c.beginPath();let st=0;
+ for(let i=0;i<a.tn;i++){const j=((a.th-a.tn+i+20)%20)*3;if(!proj(a.tr[j],a.tr[j+1],a.tr[j+2])){st=0;continue}st?c.lineTo(PR.x,PR.y):c.moveTo(PR.x,PR.y);st=1}c.stroke()}
+const PCOL=['#c4141f','#8a7552','#a98a5a','#ffd27a'];
+function drawParticles(c){for(const p of Particles.a)if(p.l>0&&proj(p.x,p.y,p.z)){const s=max(1.6,p.s*CB.f/PR.z);c.globalAlpha=clamp(p.l/p.m*1.5,0,1);c.fillStyle=PCOL[p.c];c.fillRect(PR.x-s/2,PR.y-s/2,s,s)}c.globalAlpha=1}
+
+// ----- sight aid: 3D trajectory projected, range ticks in metres -----
+function drawPred(c){const Tr=Config.sightTier,P=Pred;if(!Tr||!P.n)return;c.fillStyle='#fff6e6';
+ for(let i=0;i<P.n;i++){if(!proj(P.x[i],P.y[i],P.z[i]))continue;c.globalAlpha=Tr===2?.9*(1-i/P.n*.6):.85;c.beginPath();c.arc(PR.x,PR.y,clamp(.03*CB.f/PR.z,1.1,3.4),0,6.283);c.fill()}
+ c.globalAlpha=1;c.strokeStyle='#d4101f';c.lineWidth=1.6;c.fillStyle='#fff';c.font='700 12px system-ui,sans-serif';
+ if(Tr===3){let lx=-1e9,ly=-1e9;for(let j=0;j<P.nt;j++){if(!proj(P.tk[j*4],P.tk[j*4+1],P.tk[j*4+2]))continue;if(hypot(PR.x-lx,PR.y-ly)<30||hypot(PR.x-W/2,PR.y-H/2)<Config.sightR+16)continue;lx=PR.x;ly=PR.y;   // thin out ticks: no clutter around the pin
+  c.beginPath();c.moveTo(PR.x-7,PR.y);c.lineTo(PR.x+7,PR.y);c.stroke();c.fillText(P.tk[j*4+3]+' m',PR.x+10,PR.y+4)}}
+}
+
+// ===== RECURVE SIGHT (replaces the sniper scope): sight bar bolted to the riser, soft-focus aperture ring, fibre-optic PIN at the exact screen centre =====
+// Asset hook: swap this function (or the whole body) for a rendered sight. Contract: the pin must sit at (W/2,H/2) == the direction the arrow is aimed along.
+let edgeG=null;
+function drawRecurveSight(c){const e=sstep(Sight.vis);if(e<.01)return;const C=Config,aim=fsm.cur==='AIMING',fat=aim?Aim.fat:0,cx=W/2,cy=H/2,R=C.sightR,
+ rx=cx+(1-e)*130,ry=cy+(1-e)*150,ax=Sprites.mx||1092,ay=Sprites.my||518,dx=rx-ax,dy=ry-ay,L=hypot(dx,dy),ux=dx/L,uy=dy/L,nx=-uy,ny=ux,ex=rx-ux*R,ey=ry-uy*R;
+ c.save();c.globalAlpha=e*(Aim.cancel&&aim?.35:1);c.lineCap='round';
+ if(C.faceString){const sa=clamp(Aim.d,0,1)*(aim?1:.6);c.strokeStyle='rgba(205,190,160,'+(.04*sa).toFixed(3)+')';c.lineWidth=7;c.beginPath();c.moveTo(cx-126,-10);c.lineTo(cx-110,H+10);c.stroke();c.strokeStyle='rgba(225,210,180,'+(.11*sa).toFixed(3)+')';c.lineWidth=2;c.stroke()}   // face-side string, out of focus
+ // extension bar (soft double edge = out of focus), tapering from the riser mount to the ring
+ for(const q of[[11,.2,'#0b0f13'],[7,1,'#12181e']]){const w0=q[0],w1=q[0]*.5;c.globalAlpha=e*q[1]*(Aim.cancel&&aim?.35:1);c.fillStyle=q[2];c.beginPath();c.moveTo(ax+nx*w0/2,ay+ny*w0/2);c.lineTo(ex+nx*w1/2,ey+ny*w1/2);c.lineTo(ex-nx*w1/2,ey-ny*w1/2);c.lineTo(ax-nx*w0/2,ay-ny*w0/2);c.closePath();c.fill()}
+ c.globalAlpha=e*.55*(Aim.cancel&&aim?.35:1);c.strokeStyle='#8fa4b6';c.lineWidth=1;c.beginPath();c.moveTo(ax+nx*2.6,ay+ny*2.6);c.lineTo(ex+nx*1.4,ey+ny*1.4);c.stroke();c.globalAlpha=e*(Aim.cancel&&aim?.35:1);
+ // mount block on the riser + clamp on the ring
+ c.save();c.translate(ax,ay);c.rotate(atan2(dy,dx));c.fillStyle='#151b21';rr(c,-12,-10,26,20,4);c.fill();c.strokeStyle='#05070a';c.lineWidth=1.5;c.stroke();c.fillStyle='#6f7f8c';c.beginPath();c.arc(1,0,2.4,0,6.283);c.fill();c.restore();
+ c.save();c.translate(ex,ey);c.rotate(atan2(dy,dx));c.fillStyle='#10151a';rr(c,-6,-12,20,24,4);c.fill();c.restore();
+ // aperture ring: three strokes = soft out-of-focus edge (no ctx.filter, works on iOS)
+ for(const q of[[22,'rgba(8,10,13,.17)'],[14,'rgba(8,10,13,.36)'],[8,'rgba(11,15,19,.9)']]){c.strokeStyle=q[1];c.lineWidth=q[0];c.beginPath();c.arc(rx,ry,R,0,6.283);c.stroke()}
+ c.strokeStyle='rgba(150,176,196,.5)';c.lineWidth=1.3;c.beginPath();c.arc(rx,ry,R-3.4,-2.6,-.5);c.stroke();c.strokeStyle='rgba(90,110,128,.3)';c.lineWidth=1;c.beginPath();c.arc(rx,ry,R+3,.4,2.5);c.stroke();
+ c.restore();
+ // PIN: fixed at screen centre. Constant small dot.
+ const pa=sstep(Sight.vis*1.6)*(Aim.cancel&&aim?.35:1);
+ c.save();c.globalAlpha=pa;c.fillStyle='#fff';c.beginPath();c.arc(cx,cy,1.6,0,6.283);c.fill();                     // solid white dot: no gradient, glow, highlight or pulse
+ if(C.autoRange&&aim){c.globalAlpha=pa*.85;c.fillStyle='#cfe8d6';c.font='700 14px system-ui,sans-serif';c.fillText(Sight.kind?Math.round(Sight.R)+' m':'-- m',cx+R+14,cy+5)}
+ c.restore()}
+function drawEdgeDark(c){const a=sstep(Sight.vis);if(a<.01)return;if(!edgeG){edgeG=c.createRadialGradient(W/2,H/2,330,W/2,H/2,780);edgeG.addColorStop(0,'rgba(0,0,0,0)');edgeG.addColorStop(1,'rgba(0,0,0,.25)')}c.save();c.globalAlpha=a;c.fillStyle=edgeG;c.fillRect(0,0,W,H);c.restore()}
+// ----- AI debug overlay (DEBUG button / 'd'): top-down map bottom-left, above the CANCEL strip. Read-only view of the AI state. -----
+const DBG={mx:16,mw:264,mh:212,k:4.2},DBC=['rgba(90,200,255,.18)','rgba(90,200,255,.18)','rgba(255,190,40,.34)','rgba(224,22,38,.44)','rgba(0,0,0,0)'];
+const dbx=x=>DBG.mx+DBG.mw/2+x*DBG.k,dbz=z=>Config.cancelY*H-22-z*DBG.k;
+function drawAIDebug(c){if(!AI.debug)return;const L=Level.cur,C=Config,k=DBG.k,my=C.cancelY*H-12-DBG.mh,E=L.enemies;
+ c.save();c.fillStyle='rgba(4,7,11,.84)';c.fillRect(DBG.mx,my,DBG.mw,DBG.mh);c.strokeStyle='rgba(255,255,255,.35)';c.lineWidth=1;c.strokeRect(DBG.mx,my,DBG.mw,DBG.mh);c.beginPath();c.rect(DBG.mx,my,DBG.mw,DBG.mh);c.clip();
+ c.fillStyle='rgba(120,150,120,.4)';for(const t of L.trees){c.beginPath();c.arc(dbx(t.x),dbz(t.z),2,0,6.283);c.fill()}
+ for(const v of L.cover){c.fillStyle=v.w>0?'rgba(210,175,120,.85)':v.k==='rock'?'rgba(165,170,180,.85)':'rgba(70,175,90,.85)';if(v.w>0)c.fillRect(dbx(v.x-v.w/2),dbz(v.z+v.d/2),v.w*k,v.d*k);else{c.beginPath();c.arc(dbx(v.x),dbz(v.z),max(2,v.r*k),0,6.283);c.fill()}}
+ c.lineWidth=1;c.strokeStyle='rgba(90,200,255,.6)';for(const g of E){const R=g.route;if(R.length<2)continue;c.beginPath();for(let i=0;i<R.length;i++)i?c.lineTo(dbx(R[i].x),dbz(R[i].z)):c.moveTo(dbx(R[0].x),dbz(R[0].z));c.stroke()}
+ for(const g of E){const X=dbx(g.x),Y=dbz(g.z);
+  if(!g.alive){c.strokeStyle='#ccc';c.beginPath();c.moveTo(X-3,Y-3);c.lineTo(X+3,Y+3);c.moveTo(X+3,Y-3);c.lineTo(X-3,Y+3);c.stroke();continue}
+  const R=g.vision.range*C.nightVisionScale*k,th=g.yaw-PI/2,hf=g.vision.fovDeg*.5*D2R,hr=C.noiseGround*g.hearing.radius*C.hearingScale*k;
+  c.fillStyle=DBC[g.state];c.beginPath();c.moveTo(X,Y);c.arc(X,Y,R,th-hf,th+hf);c.closePath();c.fill();
+  c.strokeStyle='rgba(255,255,255,.2)';c.beginPath();c.arc(X,Y,hr,0,6.283);c.stroke();c.strokeStyle='rgba(255,255,255,.1)';c.beginPath();c.arc(X,Y,hr*C.noiseTree/C.noiseGround,0,6.283);c.stroke();      // hearing: ground / tree noise radius
+  if(g.ss){c.strokeStyle='#ff3040';c.beginPath();c.moveTo(X,Y);c.lineTo(dbx(g.sx),dbz(g.sz));c.stroke()}                                                                           // LOS ray to what he sees
+  c.fillStyle=g.target?'#e01626':'#dfe6ee';c.beginPath();c.arc(X,Y,3.5,0,6.283);c.fill();
+  c.fillStyle='#fff';c.font='700 10px system-ui,sans-serif';c.fillText(AI.NAMES[g.state],X+6,Y-5);c.fillStyle='rgba(255,255,255,.25)';c.fillRect(X+6,Y,24,3);c.fillStyle='#ffb020';c.fillRect(X+6,Y,24*g.meter,3)}
+ c.save();c.translate(dbx(0),dbz(0));c.rotate(CamR.yaw);c.fillStyle='#fff';c.beginPath();c.moveTo(0,-7);c.lineTo(5,5);c.lineTo(-5,5);c.closePath();c.fill();c.restore();
+ c.fillStyle='rgba(255,255,255,.55)';c.font='700 10px system-ui,sans-serif';c.fillText('AI DEBUG',DBG.mx+6,my+13);c.restore()}
+// ===== BREATH AUDIO + CUE: soft filtered-noise breathing that follows the same curve as the sway. Inhale (draw) -> long quiet exhale (window) -> ragged breaths + heartbeat as the arm tires.
+// env() is pure (testable); the WebAudio part is skipped silently when no AudioContext exists. The context is created/resumed on the first pointerdown (browser autoplay rules).
+const Breath={ac:null,g:null,f:null,nb:0,
+ env(td,fat){const B=Config.breath,d=Config.drawTime;                                // -> [gain, bandpass Hz]
+  if(td<d){const u=sstep(td/d);return[.05*u,lerp(520,950,u)]}                       // inhale: swells and brightens while the bow is drawn
+  const e=sstep((td-d)/1.1);let g=lerp(.05,.012,e),f=lerp(950,430,e);               // exhale: long, soft, falling; near silence = steady
+  if(fat>0){g+=.06*fat*(.6+.4*sin(td*11));f+=350*fat}                               // tired: shorter, ragged breaths
+  return[g,f]},
+ unlock(){if(!Config.breathAudio)return;try{if(!this.ac){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;const ac=this.ac=new AC(),n=ac.sampleRate*2,b=ac.createBuffer(1,n,ac.sampleRate),d=b.getChannelData(0);let q=1;
+   for(let i=0;i<n;i++){q=(q*16807)%2147483647;d[i]=q/1073741823-1}
+   const src=ac.createBufferSource();src.buffer=b;src.loop=true;const f=this.f=ac.createBiquadFilter();f.type='bandpass';f.Q.value=.8;const g=this.g=ac.createGain();g.gain.value=0;src.connect(f);f.connect(g);g.connect(ac.destination);src.start()}
+  if(this.ac.state==='suspended')this.ac.resume()}catch(_){this.ac=null}},
+ begin(){this.nb=0},
+ tick(td,fat){const a=this.ac;if(!a||!this.g)return;const e=this.env(td,fat),t=a.currentTime;this.g.gain.setTargetAtTime(e[0],t,.05);this.f.frequency.setTargetAtTime(e[1],t,.05);
+  if(fat>.02&&td>=this.nb){this.thump(fat);this.nb=td+lerp(.95,.45,fat)}},          // heartbeat speeds up with fatigue
+ thump(fat){const a=this.ac,o=a.createOscillator(),g=a.createGain(),t=a.currentTime;o.frequency.setValueAtTime(70,t);o.frequency.exponentialRampToValueAtTime(40,t+.12);
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.05+.12*fat,t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+.16);o.connect(g);g.connect(a.destination);o.start(t);o.stop(t+.2)},
+ end(){if(this.ac&&this.g)this.g.gain.setTargetAtTime(0,this.ac.currentTime,.06)}};
+// ===== FSM =====
+const hudWind=()=>{const L=Level.cur,lat=L.wx*CB.rx+L.wz*CB.rz;return(lat>=0?1:-1)*L.wind};
+const fsm={cur:'',st:{},go(n){const o=this.st[this.cur];if(o&&o.exit)o.exit();this.cur=n;const s=this.st[n];if(s.enter)s.enter()},update(dt){const s=this.st[this.cur];if(s.update)s.update(dt)}};
+fsm.st.READY={enter(){BowRig.nocked=1;Aim.cancel=0;Game.slow=1}};
+fsm.st.AIMING={enter(){Intro.t=max(Intro.t,2.6);Aim.td=0;Aim.d=0;Aim.ph=[Rng.next()*6.28,Rng.next()*6.28,Rng.next()*6.28,Rng.next()*6.28];Aim.ty=Aim.yaw;Aim.tp=Aim.pitch;Aim.yawv=Aim.pitchv=0;Sight.valid=false;BowRig.nocked=1;swayAt(0);Breath.begin()},
+ update(dt){Aim.td+=dt;Aim.d=drawAt(Aim.td);swayAt(Aim.td);Breath.tick(Aim.td,Aim.fat)},
+ exit(){Breath.end()}};
+fsm.st.FLIGHT={update(dt){const a=cur;Env.wx=Level.cur.wx;Env.wz=Level.cur.wz;Env.gust=1;stepArrow(a,dt,Env);
+  if(!(a.k++%3)){const i=(a.th++%20)*3;a.tr[i]=a.x;a.tr[i+1]=a.y;a.tr[i+2]=a.z;if(a.tn<20)a.tn++}
+  const h=collide(a);if(h){land(a,h);return}
+  let near=false;if(Config.killCam&&Slow.kc)for(const e of Level.cur.enemies)if(e.alive&&!e.dorm){const dx=e.x-a.x,dy=e.y+1.1-a.y,dz=e.z-a.z;if(dx*dx+dy*dy+dz*dz<36&&dx*a.vx+dy*a.vy+dz*a.vz>0)near=true}
+  Game.slow=near?.3:1}};
+fsm.st.RESOLVE={enter(){this.t=0},
+ update(dt){this.t+=dt/Game.slow*Game.slow;if(this.t>(Game.hit?(AI.won()?(Level.cur.hold||.6):.6):.45)){if(AI.won()&&!AI.al)fsm.go('WON');else if(Game.hit||Config.missPolicy!=='strict')fsm.go('READY');else{Game.failReason='ARROW MISSED';Game.fail={cause:Game.lastLand==='armor'?'deflected':'missed',why:'ARROW MISSED',guard:-1,t:AI.time,warn:0,noise:'',land:Game.lastLand};fsm.go('FAILED')}}}};
+fsm.st.ALARM={enter(){this.t=0;Game.slow=1;Aim.cancel=0},update(dt){this.t+=dt;if(this.t>Config.alarmTime){freezeShot();fsm.go('FAILED')}}};   // crimson "!" over the guard, then FAILED (freeze-frame taken once, with the "!" in it)
+fsm.st.WON={enter(){Game.endT=0;if(!Freeze.on)freezeShot()},update(dt){Game.endT+=dt}};
+fsm.st.FAILED=fsm.st.WON;
+// The camera never leaves the eye. Only the FOV target is set here (<=1.3x gentle aim zoom while drawn; eased back to rest in READY/WON/FAILED).
+function camTargets(){const f=fsm.cur,C=Camera;
+ if(f==='AIMING')C.tfov=2*atan(tan(Config.fov0*D2R/2)/(1+(Config.fovAimRatio-1)*Aim.d));
+ else if(f==='READY'||f==='WON'||f==='FAILED'||f==='ALARM')C.tfov=Config.fov0*D2R}
+// input smoothing (the pointer, not the aim truth) + sway handling per state. FLIGHT holds the view still: the arrow flies away from a steady eye.
+function aimUpdate(dt){const f=fsm.cur;
+ if(f==='AIMING'){springAxis(Aim,'yaw',Aim.ty,Config.inputOmega,dt);springAxis(Aim,'pitch',Aim.tp,Config.inputOmega,dt)}
+ else if(f!=='FLIGHT'){const k=exp(-6*dt);Aim.sy*=k;Aim.sp*=k}
+ const tg=f==='AIMING'?sstep(Aim.d*4):(f==='FLIGHT'||f==='RESOLVE')?1:0;Sight.vis+=(tg-Sight.vis)*(1-exp(-dt*(tg>Sight.vis?16:7)))}
+const ZONE=['torso','head','legs'],armorStops=(e,z)=>!e.killedBy.includes('arrow')||(e.armor.deflect.includes(z)&&!e.armor.weak.includes(z));       // part ids: torso 0, head 1, legs 2; a weak zone beats a deflect zone
+function killFx(e,a,h,hd){if(e.skin==='soldier')Foe.onKill(e,a);SFX.hit('flesh',h.x,h.z);if(hd&&lastEnemy(e))Slow.kill();if(Level.cur.fx){Shake.hit(hd?8:5.5);Camera.fov*=hd?.94:.955}}      // kill juice: fall direction, thwack, slow-mo, shake, FOV punch
+function land(a,h){Game.hit=false;a.stuck=1;a.hx=h.x;a.hy=h.y;a.hz=h.z;const sp=hypot(a.vx,a.vy,a.vz)||1;a.dx=a.vx/sp;a.dy=a.vy/sp;a.dz=a.vz/sp;
+ const KE=.5*Config.mArrow*sp*sp;a.embed=clamp(KE/50,.25,1)*(h.kind===1?.12:.14);                          // embed depth ~ impact energy
+ if(h.kind===1){const e=h.e,hd=h.part===1;a.att=e;a.ox=h.x-e.x;a.oy=h.y-e.y;a.oz=h.z-e.z;
+  if(armorStops(e,ZONE[h.part])){a.embed=.04;Game.lastLand='armor';AI.nk='armor';SFX.hit('armor',h.x,h.z);Particles.spawn(h.x,h.y,h.z,16,3,3.4);AI.onNoise(h.x,h.y,h.z,Config.noiseClank,e)}      // deflected: sticks at the surface, sparks, no kill, Game.hit stays false, clank noise
+  else{e.alive=false;e.dieT=0;Game.hit=true;Game.lastLand='kill';Particles.spawn(h.x,h.y,h.z,hd?24:15,0,hd?4:2.8);if(hd)popup(e.x,e.y+2.1,e.z,'HEADSHOT');killFx(e,a,h,hd);AI.onKill(e)}}
+ else if(h.kind===2){Game.lastLand='ground';AI.nk='ground';SFX.hit('ground',h.x,h.z);Particles.spawn(h.x,h.y,h.z,10,1,2.2);AI.onNoise(h.x,h.y,h.z,Config.noiseGround)}else if(h.kind===3){Game.lastLand='tree';AI.nk='tree';SFX.hit('tree',h.x,h.z);Particles.spawn(h.x,h.y,h.z,8,2,2);AI.onNoise(h.x,h.y,h.z,Config.noiseTree)}else{a.on=0;Game.lastLand='out'}
+ Game.slow=1;if(fsm.cur==='FLIGHT')fsm.go('RESOLVE')}
+function restart(){Input.id=-1;Level.load(Level.last<0?0:Level.last);fsm.go('READY')}
+function gotoLevel(i){if(!LEVELS[i])return;Input.id=-1;Level.load(i);fsm.go('READY')}
+// release: fire EXACTLY along the sight line shown on the last rendered frame (what you see is what you shoot); no look-back, no re-sampled sway.
+function release(){if(Aim.cancel||Aim.d<Config.minDraw){BowRig.cancel();fsm.go('READY');return}
+ let yw,pt,R;if(Sight.valid){yw=Sight.yaw;pt=Sight.pitch;R=Sight.R}else{yw=Aim.yaw+Aim.sy;pt=Aim.pitch+Aim.sp;rayRange(yw,pt);R=Sight.R}
+ Aim.yaw=Aim.ty=yw-Aim.sy;Aim.pitch=Aim.tp=pt-Aim.sp;Aim.yawv=Aim.pitchv=0;Camera.yaw=Camera.pv.yaw=yw;Camera.pitch=Camera.pv.pitch=pt;      // view stays exactly where it was shown
+ fire(yw,pt,Aim.d,R);SFX.shot(Aim.d);BowRig.nocked=0;BowRig.release();fsm.go('FLIGHT')}
+
+// ===== HUD BUTTONS (DEV) =====
+const Btns=[];(function(){const ws={debug:94,t0:44,t1:44,t2:44,t3:44,policy:150,restart:56};let x=(W-(94+176+150+56+72))/2;for(const id of['debug','t0','t1','t2','t3','policy','restart']){const b={id,x,y:372,w:ws[id],h:52};if(id.length===2&&id[0]==='t')b.t=+id[1];Btns.push(b);x+=ws[id]+12}Btns.push({id:'resume',x:W/2-110,y:530,w:220,h:56})})();
+const LvB=[];(function(){const d=[['LVL-1',0,78],['TEST-1',1,84],['TEST-2',2,84],['TEST-3',3,84],['TEST-4',4,84],['TEST-5',5,84],['HITBOX',-1,98],['SOUND',-2,104]];let x=(W-(78+84*5+98+104+7*8))/2;for(const[t,i,w]of d){LvB.push({id:i===-1?'hb':i===-2?'snd':'lv',lv:i<0?undefined:i,t:t,x:x,y:462,w:w,h:46});x+=w+8}})();   // TEMPORARY level picker (greyed = level not built yet)
+const POLS=['strict','noise','forgiving'],POLN=['STRICT','NOISE','FORGIVING'];
+const hitBtn=(x,y)=>!PM.open?null:Btns.concat(LvB).find(b=>x>=b.x-6&&x<=b.x+b.w+6&&y>=b.y-6&&y<=b.y+b.h+6);
+function onBtn(b){if(b.id==='lv'){if(LEVELS[b.lv]){gotoLevel(b.lv);PM.open=0}return}if(b.id==='hb'){Foe.hb^=1;return}if(b.id==='snd'){SFX.init();SFX.set(!SFX.on);return}if(b.id==='resume')PM.open=0;else if(b.id==='restart'){restart();PM.open=0}else if(b.id==='policy')Config.missPolicy=POLS[(POLS.indexOf(Config.missPolicy)+1)%3];else if(b.id==='debug')AI.debug^=1;else Config.sightTier=b.t}
+
+// ===== INPUT: drag = look (degrees per pixel), hold = draw, lift = loose =====
+const Input={id:-1,lx:0,ly:0},S={x:0,y:0};
+const P2=e=>{S.x=(e.clientX-View.ox)/View.scale;S.y=(e.clientY-View.oy)/View.scale;return S};
+cv.addEventListener('pointerdown',e=>{e.preventDefault();Breath.unlock();SFX.init();goFS(e);const p=P2(e),x=p.x,y=p.y;
+ if(PM.open){const b=hitBtn(x,y);if(b)onBtn(b);return}
+ const h=hudHit(x,y);if(h==='pause'){Hud.t.pause=performance.now();PM.open=1;dropAim();return}
+ if(h==='joy'){if(Joy.id<0){Joy.id=e.pointerId;try{cv.setPointerCapture(e.pointerId)}catch(_){}joyMove(e)}return}
+ if(Input.id>=0)return;
+ if(fsm.cur==='WON'||fsm.cur==='FAILED'){if(Game.endT>.35){const nb=NextB;if(fsm.cur==='WON'&&nextLevel()>=0&&Game.endT>.6&&x>=nb.x&&x<=nb.x+nb.w&&y>=nb.y&&y<=nb.y+nb.h)gotoLevel(nextLevel());else restart()}return}
+ if(h==='hand'||h==='crouch'){Hud.t[h]=performance.now();return}       // no matching game action yet: visible press, no effect
+ if(fsm.cur==='READY'&&(h==='bow'||y<H*Config.cancelY)){if(h==='bow')Hud.t.bow=performance.now();Input.id=e.pointerId;try{cv.setPointerCapture(e.pointerId)}catch(_){}Input.lx=x;Input.ly=y;Aim.cancel=0;fsm.go('AIMING')}});
+cv.addEventListener('pointermove',e=>{if(e.pointerId===Joy.id){joyMove(e);return}if(e.pointerId!==Input.id||fsm.cur!=='AIMING')return;e.preventDefault();const p=P2(e),dx=p.x-Input.lx,dy=p.y-Input.ly;Input.lx=p.x;Input.ly=p.y;
+ const g=Config.sensDeg*D2R*(1+Config.accel*min(1,hypot(dx,dy)/18))/zoomNow();
+ Aim.ty=clamp(Aim.ty+dx*g,Plate.y0,Plate.y1);Aim.tp=clamp(Aim.tp-dy*g,Plate.p0,Plate.p1);Aim.cancel=p.y>H*Config.cancelY?1:0});
+const up=e=>{if(e.pointerId===Joy.id){Joy.id=-1;Joy.x=Joy.y=0;return}if(e.pointerId!==Input.id)return;Input.id=-1;if(fsm.cur==='AIMING'){if(e.type==='pointercancel'){BowRig.cancel();fsm.go('READY')}else release()}};
+cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+const dropAim=()=>{if(Input.id>=0){Input.id=-1;if(fsm.cur==='AIMING'){BowRig.cancel();fsm.go('READY')}}};
+addEventListener('blur',dropAim);document.addEventListener('visibilitychange',()=>{last=0;acc=0;if(document.hidden)dropAim()});
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(k>='0'&&k<='3')Config.sightTier=+k;else if(k==='m')onBtn({id:'policy'});else if(k==='d')AI.debug^=1;else if(k==='h')Foe.hb^=1;else if(k==='n')onBtn({id:'snd'});else if(k==='r')restart();else if(k==='p'||k==='escape')PM.open^=1});
+
+// ===== RENDER =====
+function render(){if(!Loader.ok&&!Loader.bypass){Loader.draw();return}const c=ctx;c.setTransform(1,0,0,1,0,0);c.fillStyle='#000';c.fillRect(0,0,cv.width,cv.height);c.save();c.setTransform(View.scale*View.dpr,0,0,View.scale*View.dpr,View.ox*View.dpr,View.oy*View.dpr);c.beginPath();c.rect(0,0,W,H);c.clip();
+ updateCamR(Game.alpha);sightUpdate();const f=fsm.cur,al=Game.alpha;
+ const kAge=BowRig.releaseAge,kick=kAge<.08?sin(kAge/.08*PI)*Config.cameraKick:0;c.save();c.translate(-kick*.4+Shake.x(),kick+Shake.y());          // release camera kick + hit shake (world only, a few px)
+ drawPlate(c);buildItems();drawGround(c);Foliage.draw(c);Amb.draw(c);
+ for(const a of Arrows)if(a.on&&!a.stuck){drawTrail(c,a);drawArrow3(c,a,al)}
+ if(f==='AIMING'){Pred.run(Sight.yaw,Sight.pitch,Sight.R,Aim.d);drawPred(c)}
+ drawParticles(c);c.restore();Vign2.draw(c);
+ drawRecurveSight(c);drawIdleReticle(c);                                                                                                       // sight bar + ring + pin (pin == screen centre == aim)
+ c.save();const vx=0;c.beginPath();if(Config.handed==='right')c.rect(vx,0,W-vx,H);else c.rect(0,0,W-vx,H);c.clip();BowRig.renderViewmodel(c,1);Assets.draw('releaseStreak',c,0,0);c.restore()
+ drawEdgeDark(c);
+ if(f==='AIMING'){c.fillStyle=Aim.cancel?'rgba(196,20,31,.35)':'rgba(255,255,255,.05)';c.fillRect(0,H*Config.cancelY,W,H*(1-Config.cancelY));c.fillStyle=Aim.cancel?'rgba(255,255,255,.9)':'rgba(255,255,255,.3)';c.font='700 20px system-ui,sans-serif';c.textAlign='center';c.fillText('CANCEL',W/2,H-24);c.textAlign='left'}
+ for(const p of Pops)if(p.on&&proj(p.x,p.y+p.t*.6,p.z)){c.globalAlpha=1-p.t/1.1;c.font='italic 900 38px Impact,"Arial Black",sans-serif';c.textAlign='center';c.lineJoin='round';c.strokeStyle='#05060a';c.lineWidth=8;c.strokeText(p.s,PR.x,PR.y);c.fillStyle='#e01626';c.fillText(p.s,PR.x,PR.y);c.globalAlpha=1;c.textAlign='left'}
+ if(f==='FAILED')panel(c,'MISSION FAILED',Game.failReason,'#d4101f','Tap to retry');else if(f==='WON')panel(c,'TARGETS DOWN','NO ALARM RAISED','#d4101f','Tap to play again');
+ drawDetectHUD(c);drawHUD2(c);drawAIDebug(c);drawNext(c);Intro.draw(c);if(PM.open)drawPause(c);c.restore()}
+
+// ===== LOOP: fixed 120 Hz sim, render interpolated =====
+function sim(dt){joyStep(dt);Game.time+=dt;fsm.update(dt);aimUpdate(dt);camTargets();BowRig.update(dt);Camera.update(dt);Level.update(dt);AI.update(dt);Particles.update(dt);Rain.update(dt);Shake.update(dt);Amb.update(dt)}
+let last=0,acc=0;
+function frame(ts){requestAnimationFrame(frame);syncHold();if(!last)last=ts;const rd=min((ts-last)/1000,.1);Slow.update(rd);Intro.t+=rd;acc+=rd*Config.timeScale*Game.slow*Slow.f;last=ts;while(acc>=Config.step){sim(Config.step);acc-=Config.step}Game.alpha=acc/Config.step;render()}
+
+// ===== SELF-TESTS (console table + console.assert) =====
+function selfTest(){const R=[],ok=(n,c,v)=>{R.push({test:n,pass:!!c,value:typeof v==='number'?+v.toFixed(5):v});console.assert(c,'SELFTEST FAIL: '+n+' = '+v)};
+ const sv={k:Config.dragK,gs:Config.gravityScale,st:Config.sightTier,mp:Config.missPolicy},E0={wx:0,wz:0,gust:0,ex:0,ez:0},mk=()=>({x:0,y:0,z:0,px:0,py:0,pz:0,vx:0,vy:0,vz:0,t:0,age:0});
+ const look=(yw,pt)=>{Aim.yaw=Aim.ty=yw;Aim.pitch=Aim.tp=pt;Aim.sy=Aim.sp=0;Camera.snapTo();updateCamR(1)};
+ // fly a full-draw calm arrow to the plane d=Rg (perpendicular to the sight line); returns miss distance to the sight-line point and the crossing point
+ const cross=Rg=>{const s=mk();return s};
+ Config.sightTier=3;look(0,0);       // predictor tests need the full sight aid; the shipped default is 0 (restored at the end)
+ proj(0,EYE.y,30);ok('perspective: eye-line point -> screen centre',abs(PR.x-W/2)<1e-6&&abs(PR.y-H/2)<1e-6,PR.y);
+ proj(0,EYE.y+1.8,40);const yTop=PR.y;proj(0,EYE.y,40);ok('perspective: 1.8 m at 40 m = f*1.8/40 px',abs((PR.y-yTop)-CB.f*1.8/40)<1e-6,PR.y-yTop);
+ Config.dragK=0;Config.gravityScale=1;{const s={x:0,y:1.6,z:0,px:0,py:1.6,pz:0,vx:0,vy:0,vz:66,t:0,age:0};while(s.y>0)stepArrow(s,Config.step,E0);ok('ballistics: no-drag horizontal 66 m/s from 1.6 m lands ~37.7 m',abs(s.z-37.7)<.25,s.z)}Config.dragK=sv.k;Config.gravityScale=sv.gs;
+ ok('energy: v(1.0) in 88..100 m/s (fast arrows by design)',speedAt(1)>88&&speedAt(1)<100,speedAt(1));ok('energy: v(0.5) ~ 40-42 m/s',speedAt(.5)>39&&speedAt(.5)<43,speedAt(.5));ok('energy: v(0.2) slow',speedAt(.2)<15,speedAt(.2));
+ // 1+2: still aim, zero sway, full draw, no wind: arrow crosses the sight line at range; impact projects onto the pin
+ {let rs=7,mm=0,mp=0;const rnd=()=>(rs=(rs*16807)%2147483647)/2147483647;
+  for(const Rg of[20,40,60])for(let n=0;n<10;n++){const yw=(rnd()-.5)*1.0,pt=-.2+rnd()*.5,s=mk();launchState(s,yw,pt,1,0,Rg);const qx=EYE.x+A.fx*Rg,qy=EYE.y+A.fy*Rg,qz=EYE.z+A.fz*Rg;
+   let pd=(s.x-EYE.x)*A.fx+(s.y-EYE.y)*A.fy+(s.z-EYE.z)*A.fz,ix=0,iy=0,iz=0;
+   for(let i=0;i<600;i++){stepArrow(s,Config.step,E0);const d=(s.x-EYE.x)*A.fx+(s.y-EYE.y)*A.fy+(s.z-EYE.z)*A.fz;if(d>=Rg){const u=(Rg-pd)/(d-pd);ix=lerp(s.px,s.x,u);iy=lerp(s.py,s.y,u);iz=lerp(s.pz,s.z,u);break}pd=d}
+   mm=max(mm,hypot(ix-qx,iy-qy,iz-qz));look(yw,pt);proj(ix,iy,iz);mp=max(mp,hypot(PR.x-W/2,PR.y-H/2))}
+  ok('accuracy: 30 arrows @20/40/60 m cross the sight line within 2 cm (max m)',mm<.02,mm);ok('accuracy: impact projects within 2 px of the pin (max px)',mp<2,mp)}
+ // 3: release fires exactly along the direction the pin showed on the last rendered frame
+ {fsm.go('AIMING');Aim.td=1.3;Aim.d=drawAt(1.3);swayAt(1.3);look(.12,.03);Aim.sy=.004;Aim.sp=-.003;Camera.snapTo();Camera.update(1/120);updateCamR(.37);sightUpdate();const yy=Sight.yaw,pp=Sight.pitch;release();
+  ok('release: fire direction == last rendered pin direction (rad err)',abs(Aim.fireYaw-yy)<1e-9&&abs(Aim.firePitch-pp)<1e-9&&fsm.cur==='FLIGHT',abs(Aim.fireYaw-yy)+abs(Aim.firePitch-pp))
+  ok('camera: stays at the eye through the shot (no chase cam)',Camera.x===EYE.x&&Camera.y===EYE.y&&Camera.z===EYE.z&&(camTargets(),Camera.update(1/120),Camera.x===EYE.x&&Camera.y===EYE.y&&Camera.z===EYE.z),0)}
+ // 7: FOV narrowing is a focus effect only
+ {fsm.go('AIMING');Aim.d=1;camTargets();const r=tan(Config.fov0*D2R/2)/tan(Camera.tfov/2);ok('FOV: rest/full-draw ratio <= 1.3 (gentle aim zoom)',r<=1.3+1e-9,r)}
+ // 8: drop table
+ {let mono=true;for(let d=8;d<118;d+=2)if(phiAt(d+2,0)<=phiAt(d,0))mono=false;ok('drop table: phi(d) monotonic increasing @ level aim (gravity on) / ~0 (gravity off)',Config.gravityScale>0?mono:abs(phiAt(60,0))<.02,0);
+  ok('drop table: phi @20/40/60/80 m [mrad]',Config.gravityScale>0?(phiAt(20,0)>0&&phiAt(80,0)>phiAt(60,0)):phiAt(80,0)>=0,[20,40,60,80].map(d=>+(phiAt(d,0)*1000).toFixed(2)).join(' / '))}
+ // 5+6 + end-to-end: aim the pin at each guard
+ for(const tg of Level.cur.enemies){if(tg.inn||tg.dorm)continue;const dx=tg.x-EYE.x,dz=tg.z-EYE.z,dd=hypot(dx,dz),yw=atan2(dx,dz),pt=atan2(tg.y+1.1-EYE.y,dd);
+  Aim.sy=Aim.sp=0;rayRange(yw,pt);const Rr=Sight.R,kd=Sight.kind;
+  const sc=mk();launchState(sc,yw,pt,1,0,Rr);let hc=null;for(let n=0;n<1400&&!hc;n++){stepArrow(sc,Config.step,E0);hc=collide(sc)}
+  ok('pin on guard @ '+dd.toFixed(0)+' m: calm full-draw arrow hits the guard',hc&&hc.kind===1&&hc.e===tg,hc?hc.kind:-1);
+  ok('range readout within 0.1 m of true distance to the hit point @ '+dd.toFixed(0)+' m',hc&&kd===1&&abs(Rr-hypot(hc.x-EYE.x,hc.y-EYE.y,hc.z-EYE.z))<.1,hc?Rr-hypot(hc.x-EYE.x,hc.y-EYE.y,hc.z-EYE.z):-1);
+  Pred.run(yw,pt,Rr,1);const px=Pred.hx,py=Pred.hy,pz=Pred.hz,pk=Pred.end,e1=Pred.end;Pred.run(yw,pt,Rr,1);
+  ok('predictor stable (identical on re-run) @ '+dd.toFixed(0)+' m',hypot(Pred.hx-px,Pred.hy-py,Pred.hz-pz)<5e-4&&Pred.end===e1,hypot(Pred.hx-px,Pred.hy-py,Pred.hz-pz));
+  const sw=mk(),Ew={wx:Level.cur.wx,wz:Level.cur.wz,gust:1,ex:0,ez:0};launchState(sw,yw,pt,1,Game.time,Rr);let hw=null;for(let n=0;n<1400&&!hw;n++){stepArrow(sw,Config.step,Ew);hw=collide(sw)}
+  ok('predictor == live arrow (with wind) < 1 cm @ '+dd.toFixed(0)+' m (hit='+(hw&&hw.kind)+')',hw&&pk===1&&hypot(hw.x-px,hw.y-py,hw.z-pz)<.01,hw?hypot(hw.x-px,hw.y-py,hw.z-pz):-1)}
+ // sway
+ Aim.ph=[.3,1.4,2.2,3.1];swayAt(0);ok('sway: starts at zero (eased in, no jump)',abs(Aim.sy)+abs(Aim.sp)<1e-12,Aim.sy);
+ {let m=0,n=0,a=0;for(let t=.5;t<40;t+=.01){swayAt(t);m+=Aim.sy;a+=abs(Aim.sy);n++}ok('sway: ~zero mean, deterministic (|mean|/mean|x| < .15)',abs(m/n)/(a/n)<.15,abs(m/n)/(a/n))}
+ {const B=Config.breath,rms=(t0,t1)=>{let q=0,n=0;for(let t=t0;t<t1;t+=.01){swayAt(t);q+=Aim.sy*Aim.sy+Aim.sp*Aim.sp;n++}return sqrt(q/n/2)*1000};
+  const r0=rms(.3,.5),rw=rms(B.peak,B.holdEnd),rf=rms(B.holdEnd+B.fatLen,B.holdEnd+B.fatLen+2);
+  ok('breath: draw sway (rms mrad) is > 3x the window sway, fatigue sway is > 3x the window sway again',r0>3*rw&&rf>3*rw,r0.toFixed(2)+' / '+rw.toFixed(2)+' / '+rf.toFixed(2));
+  swayAt(.3);const c0=Aim.calm;swayAt((B.peak+B.holdEnd)/2);const c1=Aim.calm,f1=Aim.fat;swayAt(B.holdEnd+B.fatLen+1);const c2=Aim.calm,f2=Aim.fat;
+  ok('breath: calm ~0 while drawing, ~1 inside the window (fat 0), 0 once fully fatigued (fat 1)',c0<.1&&c1>.95&&f1===0&&c2===0&&f2===1,c0.toFixed(2)+'/'+c1.toFixed(2)+'/'+c2.toFixed(2));
+  ok('breath: window lasts >= 1.2 s (peak..holdEnd)',B.holdEnd-B.peak>=1.2-1e-9,B.holdEnd-B.peak);
+  const e0=Breath.env(Config.drawTime,0),e1=Breath.env(2.5,0),e2=Breath.env(5,1);ok('breath audio: inhale loudest at full draw, near-silent in the window, ragged breaths when tired',e0[0]>3*e1[0]&&e2[0]>2*e1[0]&&Breath.ac===null,e0[0].toFixed(3)+'/'+e1[0].toFixed(3)+'/'+e2[0].toFixed(3))}
+ // ===== AI / STEALTH tests: one or more per rule (data model, states, vision, bodies, noise, alarm/fail/win, scene, debug) =====
+  {const h=1/Config.aiHz,
+   sc=(es,cv,tr)=>{Level.load(0);fsm.go('READY');const L=Level.cur;Level.ai=null;Config.nightVisionScale=AIB.nv;Config.hearingScale=AIB.hs;Config.patrolSpeed=AIB.ps;L.enemies=es.map((q,n)=>Level.enemy(q,n));L.cover=(cv||[]).map((q,n)=>Level.cov(q,n));L.trees=(tr||[]).map((q,n)=>({x:q[0],z:q[1],y:0,h:q[2],type:0,seed:n}));
+    for(const g of L.enemies)g.y=0;for(const v of L.cover)v.y=0;AI.reset();Config.missPolicy='strict';return L},                           // synthetic isolated scene, flat ground
+   run=s=>{for(let i=0,n=Math.round(s*Config.aiHz);i<n&&!AI.al;i++)AI.tick(h)},kill=e=>{e.alive=false;e.dieT=0;AI.onKill(e)},dg=r=>r/D2R;
+   ok('config: sightTier default is 0 (level-1 bow = dot sight only)',sv.st===0,sv.st);
+   // --- 1. enemy model + level data carried through Level.load
+   {const e=sc([{x:3,z:9}]).enemies[0];ok('model: defaults (guard, target, no route, vision 26/70/.6/1.65, hearing 1, IDLE, meter 0)',e.type==='guard'&&e.target===true&&!e.route.length&&e.vision.range===26&&e.vision.fovDeg===70&&e.vision.noticeTime===.6&&e.vision.eyeH===1.65&&e.hearing.radius===1&&e.state===S_IDLE&&e.meter===0,e.state)}
+   {Level.load(0);const L=Level.cur,E=L.enemies,pg=E.filter(e=>e.type==='guard'&&e.route.length>=2),lk=E.filter(e=>e.type==='lookout'&&!e.route.length),mx=Math.max(...E.map(e=>hypot(e.x,e.z)));
+    ok('scene: 2 patrol guards + 1 lookout + 1 armored officer; route/vision/hearing/target carried through Level.load',E.length===4&&pg.length===2&&lk.length===1&&E.every(e=>e.vision&&e.hearing&&typeof e.target==='boolean'&&e.route.every(w=>'x' in w&&'z' in w&&'wait' in w&&'look' in w)),E.length);
+    ok('scene: both patrol guards are targets, the lookout is optional (marker = target only)',pg.every(e=>e.target)&&!lk[0].target,E.filter(e=>e.target).length);
+    ok('scene: 4 cover objects (bush + rock + wall present)',L.cover.length===4&&['bush','rock','wall'].every(k=>L.cover.some(v=>v.k===k)),L.cover.length);
+    ok('scene: everything within 42 m of the archer (dot-sight range)',mx<42&&E.every(e=>e.route.every(w=>hypot(w.x,w.z)<42))&&L.cover.every(v=>hypot(v.x,v.z)<42),mx);
+    ok('scene: no cover on the archer line to any guard start (head, chest, feet)',E.every(g=>[.3,1.1,1.62].every(y=>!coverBlocks(EYE.x,EYE.y,EYE.z,g.x,g.y+y,g.z))),0);
+    ok('scene: patrol waypoints are not inside cover',E.every(e=>e.route.every(w=>!L.cover.some(v=>v.w>0?abs(w.x-v.x)<v.w/2+.4&&abs(w.z-v.z)<v.d/2+.4:hypot(w.x-v.x,w.z-v.z)<v.r+.4))),0);
+    const sx=(a,b,c,d)=>{const r=(b.x-a.x)*(d.z-c.z)-(b.z-a.z)*(d.x-c.x);if(abs(r)<1e-9)return null;const t=((c.x-a.x)*(d.z-c.z)-(c.z-a.z)*(d.x-c.x))/r,u=((c.x-a.x)*(b.z-a.z)-(c.z-a.z)*(b.x-a.x))/r;return t>=0&&t<=1&&u>=0&&u<=1?{x:a.x+t*(b.x-a.x),z:a.z+t*(b.z-a.z)}:null};
+    let X=null;const r0=pg[0].route,r1=pg[1].route;for(let i=0;i<r0.length-1&&!X;i++)for(let j=0;j<r1.length-1&&!X;j++)X=sx(r0[i],r0[i+1],r1[j],r1[j+1]);
+    ok('scene: the two patrol routes cross',!!X,X?X.x+','+X.z:-1);
+    let ov=0;if(X){Level.load(0);const P=Level.cur.enemies,cone=(g,x,z)=>{const dx=x-g.x,dz=z-g.z,d=hypot(dx,dz);return d<=g.vision.range*Config.nightVisionScale&&(d<.3||(sin(g.yaw)*dx+cos(g.yaw)*dz)/d>=cos(g.vision.fovDeg*.5*D2R))};
+     for(let s=0;s<=1400;s++){AI.tick(h);if(s%10===0&&cone(P[0],X.x,X.z)&&cone(P[1],X.x,X.z))ov++}}
+    ok('scene: both patrol cones cover the crossing point at the same moment (cones overlap)',ov>0,ov)}
+   // --- 2. AI states
+   {const L=sc([{x:0,z:5,yaw:0}]),g=L.enemies[0];let mn=9,mxx=-9,mr=0,py=g.yaw;for(let i=0;i<240;i++){AI.tick(h);mn=min(mn,g.yaw);mxx=max(mxx,g.yaw);mr=max(mr,abs(wrapA(g.yaw-py))/h);py=g.yaw}
+    ok('IDLE: stands and scans +-35 deg (max / min deg)',abs(dg(mxx)-35)<1.5&&abs(dg(mn)+35)<1.5&&g.state===S_IDLE,dg(mxx)+'/'+dg(mn));ok('IDLE: scan is slow (< 120 deg/s) and the period is ~6 s',mr*1/D2R<120&&abs(wrapA(g.yaw))<.03,dg(mr));
+    const L2=sc([{x:0,z:0,yaw:0,route:[{x:0,z:0,wait:1,look:0},{x:0,z:12,wait:3,look:0}]}]),p=L2.enemies[0];let z05=-1,z4=0,z6=0,tr=0,pyw=p.yaw,ymx=-9,ymn=9,far=0,back=0;
+    for(let i=1;i<=900;i++){AI.tick(h);const t=i*h;if(abs(t-.5)<h/2)z05=p.z;if(abs(t-4)<h/2)z4=p.z;if(abs(t-6)<h/2)z6=p.z;tr=max(tr,abs(wrapA(p.yaw-pyw))/h);pyw=p.yaw;if(p.z>11.9)far=1;if(far&&t>16&&p.z<.5)back=1;if(p.wt>=0&&p.z>11){ymx=max(ymx,wrapA(p.yaw));ymn=min(ymn,wrapA(p.yaw))}}
+    ok('PATROL: waits at a waypoint (z still 0 @ .5 s), then walks at 1.1 m/s (z gain 4 s -> 6 s ~2.2 m)',abs(z05)<.01&&abs((z6-z4)-2.2)<.05,z6-z4);
+    ok('PATROL: turns at <= 120 deg/s (incl. the 180 deg turn back) and loops the route (far end, then back)',tr/D2R<=120+1e-6&&far&&back,dg(tr));
+    ok('PATROL: look-sweep +-40 deg while waiting at a waypoint (max / min deg)',dg(ymx)>36&&dg(ymx)<=40.01&&dg(ymn)<-36&&dg(ymn)>=-40.01,dg(ymx)+'/'+dg(ymn))}
+   {const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);L.enemies[1].alive=false;const g=L.enemies[0];run(.1);ok('NOTICING: meter > 0 -> state NOTICING',g.meter>0&&g.state===S_NOTICE,g.meter);
+    run(2);const m=g.meter;run(1);ok('ALARMED is terminal (meter stays 1, state stays ALARMED)',g.state===S_ALARMED&&g.meter===1&&m===1&&AI.al===g,g.state);
+    ok('DEAD: a killed enemy becomes DEAD and stays in Level.cur.enemies as a body',(()=>{const L2=sc([{x:0,z:0},{x:30,z:30}]);kill(L2.enemies[1]);AI.tick(h);return L2.enemies[1].state===S_DEAD&&L2.enemies.length===2&&!L2.enemies[1].alive})(),0)}
+   // --- 3. vision: cone, range x nightVisionScale, trees + cover block, meter rates
+   {const L=sc([{x:0,z:0,yaw:0}]),g=L.enemies[0],s=(x,z,y)=>aiSees(g,x,y===undefined?.3:y,z)>0,a=(deg,d)=>aiSees(g,sin(deg*D2R)*d,.3,cos(deg*D2R)*d)>0;
+    ok('vision: range = 26 x .8 = 20.8 m (seen @20.5, not @21)',s(0,20.5)&&!s(0,21),0);ok('vision: fov 70 deg (seen @34, not @36 off-axis)',a(34,10)&&a(-34,10)&&!a(36,10)&&!a(-36,10),0);ok('vision: nothing behind the guard',!s(0,-5),0);
+    const sv0=Config.nightVisionScale;Config.nightVisionScale=.5;ok('vision: Config.nightVisionScale scales the range (.5 -> 13 m)',s(0,12.5)&&!s(0,14),0);Config.nightVisionScale=sv0}
+   {const f=(es,cv,tr,x,z,y)=>{const L=sc(es,cv,tr);return aiSees(L.enemies[0],x,y,z)>0},G=[{x:0,z:0,yaw:0}];
+    ok('LOS: a tree trunk blocks the cone (tall tree at 10 m: (0,20) hidden, (3,20) seen)',!f(G,[],[[0,10,8]],0,20,.3)&&f(G,[],[[0,10,8]],3,20,.3),0);
+    ok('LOS: a short tree (h 1 m) blocks a low body but not a chest-height target (collide height test)',!f(G,[],[[0,10,1]],0,20,.3)&&f(G,[],[[0,10,1]],0,20,1.1),0);
+    ok('LOS: wall cover blocks a lying body and a standing chest point',!f(G,[['wall',0,10,4,.5,2.2]],[],0,20,.3)&&!f(G,[['wall',0,10,4,.5,2.2]],[],0,20,1.1),0);
+    ok('LOS: a 0.5 m low wall does not block',f(G,[['wall',0,10,4,.5,.5]],[],0,20,.3),0);
+    ok('LOS: bush (1.3 m) hides a body (y .3) but not a standing chest (y 1.1)',!f(G,[['bush',0,10,.8,1.3]],[],0,20,.3)&&f(G,[['bush',0,10,.8,1.3]],[],0,20,1.1),0);
+    ok('LOS: rock blocks; cover beside the line does not',!f(G,[['rock',0,10,.7,1.6]],[],0,20,.3)&&f(G,[['rock',3,10,.7,1.6]],[],0,20,.3),0);
+    const L=sc([{x:30,z:30}],[['wall',0,10,4,.5,2.2]]),s={px:0,py:1.6,pz:0,x:0,y:1.6,z:20,age:0};ok('cover blocks sight only: arrows still fly through it (collide() ignores cover)',collide(s)===null&&coverBlocks(0,1.65,0,0,1.1,20),0)}
+   {const g0=(nt,x,z)=>{const L=sc([{x:0,z:0,yaw:0,vision:{noticeTime:nt}},{x,z}]);L.enemies[1].alive=false;return L.enemies[0]};
+    let g=g0(.6,0,12);run(.3);ok('meter: fills at 1/noticeTime per second (.3 s @ .6 s -> .5)',abs(g.meter-.5)<.03,g.meter);
+    g=g0(.6,0,5);run(.2);ok('meter: x1.5 at close range (.2 s @ 5 m -> .5)',abs(g.meter-.5)<.03,g.meter);
+    g=g0(.6,12*sin(31.5*D2R),12*cos(31.5*D2R));run(.05);ok('meter: x.6 near the cone edge (1 tick @ 31.5 deg -> .05, not .083)',abs(g.meter-.05)<.004,g.meter);
+    g=sc([{x:0,z:0,yaw:0}]).enemies[0];g.meter=.6;run(.75);ok('meter: drains at 1/1.5 s without LOS (.6 -> .1 after .75 s), then back to IDLE',abs(g.meter-.1)<.03&&g.state===S_NOTICE&&(run(1),g.meter===0&&g.state===S_IDLE),g.meter);
+    g=g0(.6,0,12);run(1.5);ok('meter: full -> ALARMED, reason BODY FOUND, FSM ALARM',AI.al===g&&Game.failReason==='BODY FOUND'&&fsm.cur==='ALARM',Game.failReason);
+    g=g0(0,0,12);AI.tick(h);ok('meter: noticeTime 0 = instant alarm',AI.al===g,g.meter)}
+   // --- 3b. witnessed kill: a guard with LOS to the victim within ~1 s of the hit
+   {const W=(es,cv)=>{const L=sc(es,cv);return{L,g:L.enemies[0],v:L.enemies[1]}};let q=W([{x:0,z:0,yaw:0},{x:0,z:12}]);kill(q.v);ok('witness: LOS to the victim at the hit starts the meter at .5',q.g.meter===.5&&q.g.wit===1,q.g.meter);
+    let t=0;while(!AI.al&&t<3){AI.tick(h);t+=h}ok('witness: not dropped in time -> KILL WITNESSED within ~.4 s (noticeTime .6)',AI.al===q.g&&Game.failReason==='KILL WITNESSED'&&t<.45,t);
+    q=W([{x:0,z:0,yaw:0},{x:0,z:12}],[['wall',0,6,4,.5,2.2]]);kill(q.v);ok('witness: a wall between guard and victim = no witness (meter 0)',q.g.meter===0&&!q.g.wit,q.g.meter);
+    q=W([{x:0,z:0,yaw:180},{x:0,z:12}]);kill(q.v);const m0=q.g.meter;run(.5);q.g.yaw=0;AI.tick(h);ok('witness: facing away at the hit but turning into view within 1 s still witnesses',m0===0&&q.g.wit===1,q.g.wit);
+    q=W([{x:0,z:0,yaw:180},{x:0,z:12}]);kill(q.v);run(1.2);q.g.yaw=0;AI.tick(h);ok('witness: after the 1 s window he only finds a body (wit 0, meter > 0)',q.g.wit===0&&q.g.meter>0,q.g.meter);run(3);ok('witness: ... and the alarm reason is BODY FOUND',Game.failReason==='BODY FOUND',Game.failReason);
+    q=W([{x:0,z:0,yaw:0,vision:{noticeTime:2}},{x:0,z:12}]);kill(q.v);run(.4);kill(q.g);run(5);ok('witness: a fast second shot drops the witness and saves the mission (no alarm)',!AI.al&&!q.g.alive&&q.g.state===S_DEAD,AI.al?1:0)}
+   // --- 4. bodies stay and get found on a patrol route (land() keeps the corpse in the list and reports the kill)
+   {const L=sc([{x:0,z:20,yaw:0},{x:30,z:30}]),e=L.enemies[0],a=Arrows[0];fsm.go('FLIGHT');Hit.kind=1;land(a,{kind:1,e,part:1,x:e.x,y:e.y+1.6,z:e.z});
+    ok('bodies: land() kills, keeps the body in Level.cur.enemies, calls AI.onKill, goes to RESOLVE',!e.alive&&L.enemies.includes(e)&&AI.seq===1&&fsm.cur==='RESOLVE'&&Game.hit===true,AI.seq)}
+   {const L=sc([{x:-10,z:15,yaw:0,route:[{x:-10,z:15,wait:0},{x:10,z:15,wait:0}]},{x:8,z:15}]);L.enemies[1].alive=false;run(30);ok('bodies: a body on a patrol route is found (BODY FOUND)',AI.al===L.enemies[0]&&Game.failReason==='BODY FOUND',AI.time)}
+   // --- 5. noise (policy noise only): ground 14 m, tree 18 m, x hearing.radius x hearingScale
+   {const nz=(pol,hr,hs,d,r)=>{const L=sc([{x:0,z:0,hearing:{radius:hr}}]);Config.missPolicy=pol;Config.hearingScale=hs;AI.onNoise(0,0,d,r);Config.hearingScale=1;return AI.al&&Game.failReason==='NOISE HEARD'&&fsm.cur==='ALARM'?1:0};
+    ok('noise: ground impact 14 m (heard @13, not @15)',nz('noise',1,1,13,Config.noiseGround)===1&&nz('noise',1,1,15,Config.noiseGround)===0,0);ok('noise: tree impact 18 m (heard @17, not @19)',nz('noise',1,1,17,Config.noiseTree)===1&&nz('noise',1,1,19,Config.noiseTree)===0,0);
+    ok('noise: hearing.radius 2 doubles it (@27), Config.hearingScale .5 halves it (heard @6, not @8)',nz('noise',2,1,27,14)===1&&nz('noise',1,.5,6,14)===1&&nz('noise',1,.5,8,14)===0,0);
+    ok('noise: only under policy noise (strict / forgiving ignore it)',nz('strict',1,1,5,14)===0&&nz('forgiving',1,1,5,14)===0,0);
+    const ld=(pol,kind,d)=>{const L=sc([{x:0,z:0},{x:60,z:60}]);Config.missPolicy=pol;fsm.go('FLIGHT');land(Arrows[0],{kind,e:null,part:0,tr:null,x:0,y:0,z:d});return fsm.cur};
+    ok('noise: land() raises it on ground (kind 2) and tree (kind 3) hits: noise -> ALARM, strict -> RESOLVE',ld('noise',2,10)==='ALARM'&&ld('noise',3,17)==='ALARM'&&ld('noise',2,16)==='RESOLVE'&&ld('strict',2,5)==='RESOLVE',0)}
+   // --- 6. alarm, fail, win, policy
+   {const L=sc([{x:0,z:0},{x:30,z:30}]);fsm.go('AIMING');Input.id=7;BowRig.releaseAge=0;AI.alarm(L.enemies[0],'NOISE HEARD');
+    ok('ALARM mid-draw: Input.id = -1, BowRig.cancel(), FSM ALARM, reason set',Input.id===-1&&BowRig.releaseAge===10&&fsm.cur==='ALARM'&&Game.failReason==='NOISE HEARD',Input.id);
+    for(let i=0;i<50;i++)sim(Config.step);const mid=fsm.cur;for(let i=0;i<25;i++)sim(Config.step);ok('ALARM lasts ~.5 s then FAILED',mid==='ALARM'&&fsm.cur==='FAILED',fsm.cur)}
+   {const rs=(pol,hit,prep)=>{const L=sc([{x:-20,z:40,target:true},{x:20,z:40,target:true},{x:0,z:50,target:false}]);if(prep)prep(L.enemies);Config.missPolicy=pol;Game.hit=hit;fsm.go('RESOLVE');for(let i=0;i<150;i++)sim(Config.step);return fsm.cur},
+    dead=(...i)=>E=>i.forEach(n=>E[n].alive=false);
+    ok('RESOLVE strict: a miss fails with Game.failReason ARROW MISSED',rs('strict',false)==='FAILED'&&Game.failReason==='ARROW MISSED',Game.failReason);
+    ok('RESOLVE noise: a miss with nobody in earshot goes back to READY; forgiving too',rs('noise',false)==='READY'&&rs('forgiving',false)==='READY',0);
+    ok('WIN = all target:true dead (lookout alive is fine); a non-target kill alone is not a win',rs('strict',true,dead(0,1))==='WON'&&rs('strict',true,dead(2))==='READY'&&rs('strict',true,dead(0))==='READY',0)}
+   {Config.missPolicy='strict';const s=[];for(let i=0;i<3;i++){onBtn({id:'policy'});s.push(Config.missPolicy)}AI.debug=0;onBtn({id:'debug'});const d1=AI.debug;onBtn({id:'debug'});
+    ok('policy button / m key cycle strict > noise > forgiving > strict; DEBUG button toggles',s.join()==='noise,forgiving,strict'&&d1===1&&AI.debug===0,s.join())}
+   // --- AI gating + tick rate, determinism, retry
+   {const g=st=>{const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);L.enemies[1].alive=false;fsm.go(st);AI.update(.5);return L.enemies[0].meter};
+    ok('AI runs only in READY / AIMING / FLIGHT / RESOLVE (meter moves there, frozen in ALARM / WON / FAILED)',['READY','AIMING','FLIGHT','RESOLVE'].every(s=>g(s)>0)&&['ALARM','WON','FAILED'].every(s=>g(s)===0),0);
+    sc([{x:0,z:0}]);for(let i=0;i<1200;i++)AI.update(Config.step);ok('AI ticks at 20 Hz inside the 120 Hz sim (10 s -> 10.0 s of AI time)',abs(AI.time-10)<.06,AI.time)}
+   {const snap=()=>{Level.load(0);for(let i=0;i<1600;i++)AI.tick(h);return Level.cur.enemies.map(e=>[e.x,e.z,e.yaw,e.meter,e.state].join()).join('|')};const a=snap(),b=snap();ok('deterministic: two 80 s runs of the scene are identical (no Math.random)',a===b&&a.length>10,a.length)}
+   {Level.load(0);const L=Level.cur;for(let i=0;i<400;i++)AI.tick(h);kill(L.enemies[0]);Game.failReason='X';AI.alarm(L.enemies[1],'BODY FOUND');Arrows[0].on=1;Pops[0].on=1;Particles.a[0].l=1;restart();const M=Level.cur.enemies,d=LEVELS[0].enemies;
+    ok('retry: restart() resets enemies (alive, start pos/yaw, meter 0), bodies, alarm, reason, arrows, popups, particles',M.every((e,n)=>e.alive&&e.meter===0&&e.state===(e.route.length?S_PATROL:S_IDLE)&&e.x===d[n].x&&e.z===d[n].z&&abs(e.yaw-(d[n].yaw||0)*D2R)<1e-12&&e.wp===0&&e.wit===0)&&!AI.al&&Game.failReason===''&&!Arrows[0].on&&!Pops[0].on&&Particles.a[0].l===0&&fsm.cur==='READY'&&Input.id===-1&&Level.cur.cover.length===4,M.length)}
+   // --- scene solvable by timing kills in blind windows, failable by sloppy shots (real AI, real level, shot must be geometrically possible)
+   {const trial=(kills,tail)=>{Level.load(0);fsm.go('READY');const E=Level.cur.enemies;let k=0,end=0;for(const q of kills)end=max(end,q[0]);end+=tail;
+     for(let s=0;s*h<=end+1e-9;s++){const t=s*h;while(k<kills.length&&kills[k][0]<=t+1e-9){const e=E[kills[k][1]];Aim.sy=Aim.sp=0;rayRange(atan2(e.x-EYE.x,e.z-EYE.z),atan2(e.y+1.1-EYE.y,hypot(e.x-EYE.x,e.z-EYE.z)));if(!(Sight.kind===1&&Hit.e===e))return'NOSHOT';kill(e);k++}
+      AI.tick(h);if(AI.al)return Game.failReason}return''};
+    let t1=-1,t2=-1,fail=0,win=0;for(let t=2;t<=60&&t1<0;t++)if(!trial([[t,0]],12)&&!trial([[t+1,0]],12)&&!trial([[t+2,0]],12))t1=t;                    // first target: a window of >= 3 s
+    if(t1>=0)for(let t=t1+3;t<=t1+60&&t2<0;t++)if(!trial([[t1,0],[t,1]],12)&&!trial([[t1,0],[t+1,1]],12))t2=t;
+    if(t2>=0){trial([[t1,0],[t2,1]],12);win=AI.won()&&!AI.al?1:0}
+    for(let t=2;t<=60;t+=2){const r=trial([[t,0]],12);if(r==='KILL WITNESSED'||r==='BODY FOUND')fail++}
+    ok('scene: solvable by timing (first target safe from t='+t1+' s for >=3 s, second safe at t='+t2+' s), both targets dead = win',t1>=0&&t2>=0&&win===1,t1+'/'+t2);
+    ok('scene: failable by sloppy shots (witnessed or body found at many kill times)',fail>=5,fail)}
+   // --- render: facing/visor, cover items, ALARM mark, FAILED reason line, policy label, DEBUG map (no throw in every state)
+   {const sink=[],ft=ctx.fillText;ctx.fillText=function(s){sink.push(String(s));return ft.apply(this,arguments)};let er='';const rd=()=>{sink.length=0;try{render()}catch(x){er=x.message}},has=s=>sink.includes(s);
+    Level.load(0);fsm.go('READY');AI.debug=1;rd();ok('render: DEBUG map shows guard states + title; DEBUG off hides it',has('AI DEBUG')&&has('PATROL')&&has('IDLE')&&(AI.debug=0,rd(),!has('AI DEBUG')),er);
+    ok('render: ITEMS include the cover (depth-sorted with trees)',ITEMS.filter(i=>i.k===4).length===4,ITEMS.length);
+    Config.missPolicy='noise';PM.open=1;rd();PM.open=0;ok('render: pause-menu policy label shows NOISE',has('NOISE')&&has('DEBUG'),er);Config.missPolicy='strict';
+    Game.failReason='NOISE HEARD';fsm.go('FAILED');Game.endT=1;rd();ok('render: FAILED panel shows Game.failReason as the sub-line',has('NOISE HEARD')&&has('Tap to retry'),er);
+    Level.load(0);AI.al=Level.cur.enemies[0];fsm.go('ALARM');rd();ok('render: ALARM draws the crimson "!" over the guard',has('!')&&er==='',er);delete ctx.fillText;Level.load(0);fsm.go('READY')}
+   // ===== STAGE B tests: armor zones + deflect + clank, comic panels + freeze-frame, detection HUD, per-level difficulty overrides =====
+   {const AR={deflect:['torso','legs'],weak:['head']},zone=y=>{sc([{x:0,z:20}]);const q={px:0,py:y,pz:0,x:0,y,z:40,age:0},hh=collide(q);return hh&&hh.kind===1?hh.part:-1},
+    hit=(es,part,pol)=>{const L=sc(es);Config.missPolicy=pol||'strict';const e=L.enemies[0],a=Arrows[0];a.stuck=0;a.att=null;Pops.forEach(p=>p.on=0);Particles.a.forEach(p=>p.l=0);fsm.go('FLIGHT');land(a,{kind:1,e,part,x:e.x,y:e.y+1.1,z:e.z});return{L,e,a}},
+    OF={x:0,z:20,armor:AR},FAR={x:50,z:50};
+    ok('armor: collide() part ids — legs 2, torso 0, head 1',zone(.3)===2&&zone(1.1)===0&&zone(1.62)===1,zone(.3)+','+zone(1.1)+','+zone(1.62));
+    let q=hit([OF,FAR],0);ok('armor: hit on a deflect zone = no kill, Game.hit false, arrow sticks to him at the surface (shallow), no kill event',q.e.alive&&Game.hit===false&&q.a.stuck===1&&q.a.att===q.e&&q.a.embed<=.05&&AI.seq===0&&fsm.cur==='RESOLVE',q.a.embed);
+    ok('armor: deflect throws sparks',Particles.a.some(p=>p.l>0&&p.c===3),0);
+    q=hit([OF,FAR],2);ok('armor: legs are a deflect zone too',q.e.alive&&Game.hit===false,0);
+    q=hit([OF,FAR],1);ok('armor: weak zone (head) kills even on an armored enemy (Game.hit true, HEADSHOT popup)',!q.e.alive&&Game.hit===true&&Pops.some(p=>p.on),0);
+    q=hit([{x:0,z:20},FAR],2);ok('unarmored: legs kill, and no HEADSHOT popup for a non-head part',!q.e.alive&&Game.hit===true&&!Pops.some(p=>p.on),0);
+    q=hit([{x:0,z:20,killedBy:[]},FAR],1);ok('killedBy [] : arrows never kill, even on a head hit (default killedBy is [arrow])',q.e.alive&&Game.hit===false&&sc([{x:0,z:0}]).enemies[0].killedBy.join()==='arrow',0);
+    const nzr=(d)=>{sc([{x:0,z:0},{x:50,z:50}]);Config.missPolicy='noise';AI.onNoise(0,0,d,Config.noiseClank);return AI.al?1:0};
+    ok('clank noise radius is 20 m (heard @19, not @21)',Config.noiseClank===20&&nzr(19)===1&&nzr(21)===0,0);
+    q=hit([OF,FAR],0,'noise');ok('clank under policy noise alerts the struck enemy (NOISE HEARD, FSM ALARM, no RESOLVE)',AI.al===q.e&&Game.failReason==='NOISE HEARD'&&fsm.cur==='ALARM',fsm.cur);
+    q=hit([OF,FAR],0,'forgiving');ok('clank under forgiving/strict raises no noise alarm',!AI.al&&fsm.cur==='RESOLVE'&&(q=hit([OF,FAR],0,'strict'),!AI.al&&fsm.cur==='RESOLVE'),0);
+    const fin=pol=>{q=hit([OF,FAR],0,pol);for(let i=0;i<150;i++)sim(Config.step);return fsm.cur};
+    ok('deflect resolves per policy: strict -> FAILED (ARROW MISSED), forgiving -> READY, noise -> ALARM',fin('strict')==='FAILED'&&Game.failReason==='ARROW MISSED'&&fin('forgiving')==='READY'&&fin('noise')==='FAILED'&&Game.failReason==='NOISE HEARD',0)}
+   {Level.load(0);const E=Level.cur.enemies,of=E.filter(e=>e.armor.deflect.length),o=of[0];
+    ok('scene: exactly 1 armored officer, target:false, weak head, killedBy [arrow]',of.length===1&&!o.target&&o.armor.weak.includes('head')&&!o.armor.deflect.includes('head')&&o.killedBy.join()==='arrow',of.length);
+    const shoot=(dy)=>{Level.load(0);fsm.go('READY');Level.cur.wx=Level.cur.wz=0;Config.missPolicy='strict';const e=Level.cur.enemies[3],dx=e.x-EYE.x,dz=e.z-EYE.z,dd=hypot(dx,dz),yw=atan2(dx,dz),pt=atan2(e.y+dy-EYE.y,dd);Aim.sy=Aim.sp=0;rayRange(yw,pt);fire(yw,pt,1,Sight.R);fsm.go('FLIGHT');let n=0;while(fsm.cur==='FLIGHT'&&n++<4000)sim(Config.step);return e};
+    let e=shoot(1.1);const a=cur;ok('officer (real arrow, torso): deflects — alive, Game.hit false, arrow stuck in him',e.alive&&Game.hit===false&&a.stuck===1&&a.att===e,e.alive?1:0);
+    e=shoot(1.62);ok('officer (real arrow, head): the weak point kills',!e.alive&&Game.hit===true,e.alive?1:0)}
+   // --- comic panels: one freeze-frame canvas, captured once
+   {const sink=[],ft=ctx.fillText;ctx.fillText=function(s){sink.push(String(s));return ft.apply(this,arguments)};let dc=0;ctx.drawImage=function(im){if(im===Freeze.cv)dc++};const has=s=>sink.includes(s);
+    Level.load(0);fsm.go('READY');const n0=Freeze.n;AI.alarm(Level.cur.enemies[0],'BODY FOUND');for(let i=0;i<80;i++)sim(Config.step);const n1=Freeze.n,cv0=Freeze.cv;sink.length=0;dc=0;for(let i=0;i<10;i++)render();
+    ok('panels: freeze-frame captured ONCE at ALARM into one offscreen canvas <= 640x360 (not per frame)',n1===n0+1&&Freeze.n===n1&&fsm.cur==='FAILED'&&cv0&&cv0.width<=640&&cv0.height<=360&&Freeze.cv===cv0,Freeze.n-n0);
+    ok('panels: FAILED panel = headline + reason line + retry hint, freeze-frame drawn from the cache each render',has('MISSION FAILED')&&has('BODY FOUND')&&has('Tap to retry')&&dc===10,dc);
+    restart();const n2=Freeze.n;for(const e of Level.cur.enemies)if(e.target)e.alive=false;Game.hit=true;fsm.go('RESOLVE');for(let i=0;i<150;i++)sim(Config.step);sink.length=0;for(let i=0;i<5;i++)render();
+    ok('panels: WON captures once more (same canvas) and shows TARGETS DOWN',fsm.cur==='WON'&&Freeze.n===n2+1&&Freeze.cv===cv0&&has('TARGETS DOWN')&&has('NO ALARM RAISED'),Freeze.n-n2);
+    restart();const n3=Freeze.n;Config.missPolicy='strict';Game.hit=false;fsm.go('RESOLVE');for(let i=0;i<150;i++)sim(Config.step);ok('panels: a plain miss-FAIL (no ALARM) also captures exactly once',fsm.cur==='FAILED'&&Freeze.n===n3+1&&Game.failReason==='ARROW MISSED',Freeze.n-n3);
+    delete ctx.fillText;delete ctx.drawImage}
+   // --- detection HUD: "!" meter, edge chevron, vignette pulse (gradient cached)
+   {const sink=[],ft=ctx.fillText;ctx.fillText=function(s){sink.push(String(s));return ft.apply(this,arguments)};let st=0;const sk=ctx.stroke;ctx.stroke=function(){st++;return sk.apply(this,arguments)};
+    Level.load(0);fsm.go('READY');const E=Level.cur.enemies;look(0,0);sink.length=0;render();const n0=sink.filter(x=>x==='!').length;E[0].meter=.6;E[0].state=S_NOTICE;sink.length=0;render();const n1=sink.filter(x=>x==='!').length;
+    ok('HUD: crimson "!" meter above a noticing guard (none when all meters are 0)',n0===0&&n1>=1,n1);E[0].meter=0;
+    const g=x=>({x:x[0],z:x[1]});look(0,0);ok('HUD: edge chevron side — inside view 0, off-screen right +1, left -1, behind non-zero (uses CamR.yaw + horizontal FOV)',noticeSide(g([0,20]))===0&&noticeSide(g([40,5]))===1&&noticeSide(g([-40,5]))===-1&&noticeSide(g([0,-20]))!==0,0);
+    look(0,0);const far=E[1];far.x=-60;far.z=5;far.meter=0;st=0;render();const s0=st;far.meter=.6;far.state=S_NOTICE;st=0;render();ok('HUD: a noticing guard outside the view draws an edge chevron (extra strokes)',st>s0,st-s0);far.meter=0;
+    const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);L.enemies[1].alive=false;fsm.go('READY');for(let i=0;i<60;i++)AI.update(Config.step);const v1=AI.vig;look(0,0);render();const vg=Vig.g;render();render();
+    ok('HUD: red vignette level rises while a meter fills; its gradient is cached once',v1>.05&&Vig.g===vg&&vg!==null,v1);
+    L.enemies[1].alive=true;for(let i=0;i<300;i++)AI.update(Config.step);ok('HUD: vignette fades when nothing is filling',AI.vig<.02,AI.vig);
+    delete ctx.fillText;delete ctx.stroke}
+   // --- per-level difficulty overrides (LEVELS[i].ai): scales multiply, noticeTime/hearingScale/nightVisionScale/missPolicy replace
+   {const mk=ai=>{LEVELS.push(Object.assign({},LEVELS[0],{ai}));return LEVELS.length-1},
+    early=mk({visionRangeScale:.8,fovScale:.8,noticeTime:2,hearingScale:.5,patrolSpeedScale:.5,nightVisionScale:.8,missPolicy:'forgiving'}),late=mk({visionRangeScale:1.2,fovScale:1.2,noticeTime:.2,hearingScale:1.2,patrolSpeedScale:1.5,nightVisionScale:1,missPolicy:'strict'}),
+    at=i=>{Level.load(i);const L=Level.cur;L.cover=[];L.trees=[];L.enemies=[Level.enemy({x:0,z:0,yaw:0},0),Level.enemy({x:0,z:10},1)];L.enemies[1].alive=false;AI.reset();let t=0;while(!AI.al&&t<20){AI.tick(h);t+=h}return t},
+    spd=i=>{Level.load(i);const L=Level.cur;L.cover=[];L.trees=[];L.enemies=[Level.enemy({x:0,z:0,yaw:0,route:[{x:0,z:0,wait:0},{x:0,z:80,wait:0}]},0)];const g=L.enemies[0];let z4=0;for(let k=1;k<=120;k++){AI.tick(h);if(k===80)z4=g.z}return(g.z-z4)/2},
+    hear=(i,d)=>{Level.load(i);Level.cur.enemies=[Level.enemy({x:0,z:0},0)];Config.missPolicy='noise';AI.reset();AI.onNoise(0,0,d,Config.noiseGround);return AI.al?1:0};
+    const te=at(early),tl=at(late);ok('overrides: noticeTime — early level alarms in ~2 s, late level in ~.2 s (same scene)',abs(te-2)<.15&&abs(tl-.2)<.1,te+'/'+tl);
+    ok('overrides: patrolSpeedScale scales walking speed (early .55 m/s, late 1.65 m/s)',abs(spd(early)-.55)<.05&&abs(spd(late)-1.65)<.05,spd(early)+'/'+spd(late));
+    ok('overrides: hearingScale — ground noise @6 m: heard on late (x1.2 = 16.8 m), not heard on early (x.5 = 7 m @ 8 m)',hear(late,16)===1&&hear(early,8)===0&&hear(early,6)===1,0);
+    Level.load(early);const E=Level.cur.enemies;ok('overrides: vision range / fov scales apply to enemies (26 x .8, 70 x .8); own noticeTime kept (lookout 2.4)',abs(E[0].vision.range-20.8)<1e-9&&abs(E[0].vision.fovDeg-56)<1e-9&&E[0].vision.noticeTime===2&&E[2].vision.noticeTime===2.4&&Config.nightVisionScale===.8,E[0].vision.range);
+    Level.load(late);ok('overrides: nightVisionScale replaces the config value, missPolicy applies when the level starts',Config.nightVisionScale===1&&Config.missPolicy==='strict'&&Level.last===late,Config.nightVisionScale);
+    LEVELS.length=1;Level.last=0;Level.load(0);const A=LEVELS[0].ai;ok('level 1 data is forgiving: longer notice time, shorter sight, policy noise (applied to its enemies)',A.noticeTime>.6&&A.visionRangeScale<1&&A.missPolicy==='noise'&&Level.cur.enemies[0].vision.noticeTime===A.noticeTime&&Level.cur.enemies[0].vision.range<26,A.noticeTime);
+    {Level.load(0);fsm.go('READY');const L=Level.cur,A1=LEVELS[0].ai,g=L.enemies[1];Config.missPolicy='noise';fsm.go('FLIGHT');land(Arrows[0],{kind:2,e:null,part:0,tr:null,x:g.x,y:g.y,z:g.z-2});
+     const a0=!AI.al&&g.nw===A1.noiseWarn&&fsm.cur==='RESOLVE';let t=0;while(!AI.al&&t<4){AI.tick(h);t+=h}const F=Game.fail;
+     ok('level 1 ships with the fairness rules on (minWarn 1.2, noiseWarn 2): a ground miss next to a guard is a ~2 s visible countdown, not an instant alarm; cause noise/ground, warn ~2',A1.minWarn===1.2&&A1.noiseWarn===2&&a0&&!!F&&F.cause==='noise'&&F.noise==='ground'&&abs(F.warn-2)<.1&&abs(t-2)<.1,JSON.stringify(F))}
+    {Level.load(0);const L=Level.cur,v=L.enemies[3],w=L.enemies[2];Level.cur.cover=[];Level.cur.trees=[];v.x=0;v.z=15;w.x=0;w.z=0;w.yaw=0;w.vision.noticeTime=.2;for(const e of L.enemies)if(e!==v&&e!==w)e.alive=false;kill(v);let t=0;while(!AI.al&&t<4){AI.tick(h);t+=h}
+     ok('level 1: a witnessed kill gives >= minWarn (1.2 s) of warning even against a fast (.2 s) noticeTime',w.wit===1&&Game.fail&&Game.fail.cause==='witnessed'&&Game.fail.warn>=1.15&&t>=1.15,t)}
+    Config.missPolicy='forgiving';restart();ok('retry keeps the DEV-button policy choice (the level policy is applied at level start only)',Config.missPolicy==='forgiving'&&Level.cur.enemies.every(e=>e.alive),0)}
+   // ===== FAIRNESS tests: every fail has ONE recorded cause (Game.fail); new detection rules are opt-in per level via LEVELS[i].ai =====
+   {const fin=()=>{fsm.go('RESOLVE');for(let i=0;i<150;i++)sim(Config.step);return fsm.cur},land1=(L,pol,hitObj)=>{Config.missPolicy=pol;fsm.go('FLIGHT');land(Arrows[0],hitObj);return fsm.cur};
+    {const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);kill(L.enemies[1]);let t=0;while(!AI.al&&t<3){AI.tick(h);t+=h}const F=Game.fail;
+     ok('fail record: witnessed kill -> cause witnessed, the guard id, warn = time the meter was on, UI string unchanged',!!F&&F.cause==='witnessed'&&F.guard===0&&F.why==='KILL WITNESSED'&&Game.failReason==='KILL WITNESSED'&&abs(F.warn-t)<.06&&F.warn>0&&F.noise==='',JSON.stringify(F))}
+    {const L=sc([{x:-10,z:15,yaw:0,route:[{x:-10,z:15,wait:0},{x:10,z:15,wait:0}]},{x:8,z:15}]);L.enemies[1].alive=false;run(30);const F=Game.fail;
+     ok('fail record: body found -> cause body, warn > 0',!!F&&F.cause==='body'&&F.guard===0&&F.warn>0&&F.why==='BODY FOUND',JSON.stringify(F))}
+    {const nk=(kind,d)=>{const L=sc([{x:0,z:0},{x:60,z:60}]);land1(L,'noise',{kind,e:null,part:0,tr:null,x:0,y:0,z:d});return Game.fail};
+     const g=nk(2,5),t=nk(3,5);
+     ok('fail record: noise -> cause noise, kind ground / tree, warn 0 (legacy instant rule)',g&&g.cause==='noise'&&g.noise==='ground'&&g.warn===0&&t&&t.cause==='noise'&&t.noise==='tree'&&t.warn===0,JSON.stringify(g)+JSON.stringify(t))}
+    {const L=sc([{x:0,z:20,armor:{deflect:['torso','legs'],weak:['head']},target:false},{x:30,z:60}]);land1(L,'noise',{kind:1,e:L.enemies[0],part:0,tr:null,x:0,y:1,z:20});const F=Game.fail;
+     ok('fail record: armor clank under noise -> cause noise, kind armor',!!F&&F.cause==='noise'&&F.noise==='armor'&&F.guard===0,JSON.stringify(F))}
+    {const L=sc([{x:0,z:20},{x:30,z:60}]);land1(L,'strict',{kind:2,e:null,part:0,tr:null,x:0,y:0,z:5});const r=fin(),F=Game.fail;
+     ok('fail record: strict ground miss -> cause missed, land ground, UI string ARROW MISSED',r==='FAILED'&&!!F&&F.cause==='missed'&&F.land==='ground'&&Game.failReason==='ARROW MISSED'&&F.noise==='',JSON.stringify(F))}
+    {const L=sc([{x:0,z:20,armor:{deflect:['torso','legs'],weak:['head']},target:false},{x:30,z:60}]);land1(L,'strict',{kind:1,e:L.enemies[0],part:0,tr:null,x:0,y:1,z:20});const r=fin(),F=Game.fail;
+     ok('fail record: strict torso hit on the armored officer -> cause deflected (not missed); UI string stays ARROW MISSED (pinned)',r==='FAILED'&&!!F&&F.cause==='deflected'&&F.land==='armor'&&Game.failReason==='ARROW MISSED',JSON.stringify(F))}
+    {const L=sc([{x:0,z:20},{x:30,z:60}]);land1(L,'strict',{kind:2,e:null,part:0,tr:null,x:0,y:0,z:5});fin();const had=!!Game.fail;Level.load(0);ok('fail record: Level.load / restart clears it (no stale cause)',had&&Game.fail===null&&Game.lastLand===null,0)}}
+   // --- minWarn (detection floor): from the first sign (witnessed kill or body in view) to the alarm takes >= minWarn s; shorter noticeTimes are floored, longer ones kept
+   {const alarmT=(es,mw,pre)=>{const L=sc(es);Level.ai=mw?{minWarn:mw}:null;if(pre)pre(L);let t=0;while(!AI.al&&t<8){AI.tick(h);t+=h}Level.ai=null;return t};
+    {const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);Level.ai={minWarn:1.2};kill(L.enemies[1]);const g=L.enemies[0],m0=g.meter;let t=0;while(!AI.al&&t<4){AI.tick(h);t+=h}const F=Game.fail;Level.ai=null;
+     ok('minWarn: a witnessed kill starts the meter near 0 (not .5) and alarms after ~minWarn (1.2 s), cause witnessed with the same warn',m0<.05&&g.wit===1&&t>1.1&&t<1.35&&!!F&&F.cause==='witnessed'&&abs(F.warn-t)<.1,m0+'/'+t)}
+    {const tf=alarmT([{x:0,z:0,yaw:0,vision:{noticeTime:.1}},{x:0,z:5}],0,L=>{L.enemies[1].alive=false}),tm=alarmT([{x:0,z:0,yaw:0,vision:{noticeTime:.1}},{x:0,z:5}],1,L=>{L.enemies[1].alive=false});
+     ok('minWarn: finding a body takes >= minWarn even at noticeTime .1 and close range (legacy: ~.07 s)',tf<.15&&tm>.95&&tm<1.1,tf+'/'+tm)}
+    {const t=alarmT([{x:0,z:0,yaw:0,vision:{noticeTime:2}},{x:0,z:12}],1.2,L=>{L.enemies[1].alive=false});ok('minWarn: only a floor — a slower noticeTime (2 s) is kept',abs(t-2)<.1,t)}
+    {const L=sc([{x:0,z:0,yaw:0},{x:0,z:12}]);Level.ai={minWarn:1.2};kill(L.enemies[1]);for(let i=0;i<16;i++)AI.tick(h);const before=!AI.al;L.enemies[0].alive=false;run(3);Level.ai=null;
+     ok('minWarn: the witness can be dropped inside the window (killed at .8 s -> no alarm)',before&&!AI.al&&fsm.cur!=='ALARM',0)}}
+   // --- noiseWarn: a noise starts a visible countdown on the hearing guard instead of an instant alarm; he faces the sound; killing him cancels it
+   {const nzs=(nw,pol)=>{const L=sc([{x:0,z:0,yaw:0},{x:60,z:60}]);Level.ai=nw?{noiseWarn:nw}:null;Config.missPolicy=pol||'noise';return L};
+    {const L=nzs(1.5);fsm.go('FLIGHT');land(Arrows[0],{kind:2,e:null,part:0,tr:null,x:0,y:0,z:5});const g=L.enemies[0],a0=!AI.al&&fsm.cur!=='ALARM'&&g.nw===1.5;run(.5);const m5=g.meter,st=g.state;run(.9);const a1=!AI.al;run(.3);const F=Game.fail;Level.ai=null;
+     ok('noiseWarn: ground noise -> countdown (no instant alarm), meter rises with it (.33 @ .5 s), NOTICE; alarm after 1.5 s, cause noise/ground, warn ~1.5',a0&&abs(m5-.33)<.06&&st===S_NOTICE&&a1&&AI.al===g&&Game.failReason==='NOISE HEARD'&&!!F&&F.cause==='noise'&&F.noise==='ground'&&abs(F.warn-1.5)<.1,m5+'/'+JSON.stringify(F))}
+    {const L=nzs(1.5);AI.onNoise(0,0,5,Config.noiseGround);const g=L.enemies[0];run(.5);g.alive=false;run(3);Level.ai=null;ok('noiseWarn: killing the hearing guard inside the window cancels the alarm',!AI.al&&fsm.cur!=='ALARM',0)}
+    {const L=nzs(1.5);AI.onNoise(8,0,0,Config.noiseGround);const g=L.enemies[0];run(1);const d=abs(wrapA(g.yaw-atan2(8,0)));Level.ai=null;ok('noiseWarn: the guard turns to face the sound (yaw within .05 rad after 1 s)',d<.05,d)}
+    {const L=nzs(1.5);AI.onNoise(0,0,15,Config.noiseGround);const a=!L.enemies[0].nw;Level.ai=null;ok('noiseWarn: radius rules unchanged (15 m ground noise is still out of earshot)',a,0)}
+    {const L=nzs(1.5,'strict');AI.onNoise(0,0,5,Config.noiseGround);const a=!L.enemies[0].nw;Level.ai=null;ok('noiseWarn: strict policy still ignores noise',a,0)}
+    {const L=nzs(1.5);const g=L.enemies[0];AI.onNoise(0,0,5,Config.noiseGround);run(.5);const n1=g.nw;AI.onNoise(0,0,5,Config.noiseGround);Level.ai=null;ok('noiseWarn: a second noise does not restart or extend the countdown',abs(n1-1)<.06&&abs(g.nw-n1)<1e-9,n1+'/'+g.nw)}
+    {const L=sc([{x:0,z:20,armor:{deflect:['torso','legs'],weak:['head']},target:false},{x:60,z:60}]);Level.ai={noiseWarn:1.5};Config.missPolicy='noise';fsm.go('FLIGHT');land(Arrows[0],{kind:1,e:L.enemies[0],part:0,tr:null,x:0,y:1,z:20});const a=!AI.al&&L.enemies[0].nw===1.5&&L.enemies[0].nk==='armor';run(1.6);const F=Game.fail;Level.ai=null;
+     ok('noiseWarn: the armor clank is a countdown too (kind armor), then NOISE HEARD',a&&AI.al===L.enemies[0]&&!!F&&F.noise==='armor',JSON.stringify(F))}}
+  }
+  {const im={width:1672,height:941},f0=H/2/tan(Config.fov0*D2R/2),Fo=Foliage,r0=Fo.lay(im,Fo.yr,0,f0,f0);                                    // Foliage.lay is pure: a stub the size of the art is enough
+   ok('foliage: at rest the art hangs `sink` px below the stage bottom (no gap, no float) and is wider than the stage',abs(r0.y0+r0.h-H-Fo.sink)<1e-6&&r0.w>=W,r0.y0+r0.h);
+   const ra=Fo.lay(im,Fo.yr,0,f0,f0),rb=Fo.lay(im,Fo.yr+.1,0,f0,f0),rate=(ra.x0-rb.x0)/(f0*(tan(.1)));                                       // screen px moved per (f*tan(yaw)): the plate moves exactly 1.0
+   ok('foliage is WORLD-locked: it pans with the plate (1.0x) and a little faster (parallax), never stuck to the screen',rate>=1&&rate<=1.25,rate);
+   const rz=Fo.lay(im,Fo.yr,0,f0*1.3,f0);ok('foliage zooms with the aim FOV (scale x1.3 at full draw)',abs(rz.w/r0.w-1.3)<1e-9,rz.w/r0.w);
+   {let worst=1e9;const pad=document.createElement('canvas');pad.width=im.width;pad.height=240;const hp=pad.height/im.height;                           // bleed height is fixed by Foliage.build (240 art px)
+    for(let y=-.3;y<=.34;y+=.02)for(let p=-.14;p<=.21;p+=.02)for(let z=1;z<=1.31;z+=.05){const T=Fo.lay(im,y,p,f0*z,f0);worst=min(worst,T.y0+T.h*(1+hp)-H)}
+    ok('foliage never shows a gap at the bottom anywhere in the camera envelope (yaw +-.3, pitch -.14..+.21, zoom 1..1.3, incl. sway margin)',worst>=0,worst)}
+   {const c1=document.createElement('canvas');c1.width=64;c1.height=32;const g1=c1.getContext('2d');g1.fillStyle='#345';g1.fillRect(0,0,64,32);const b=Fo.build(c1);
+    ok('foliage bleed canvas builds (full art width, dark soft fade, transparent at its top edge)',b.width===64&&b.height===240,b.height)}}
+ // ===== TEST-5 interior soldier: occlusion invariant, hit rule, patrol (skipped at boot: the level + assets are not there yet) =====
+ if(Loader.ok&&Foe.ready){if(LEVELS.length<6){LEVELS.length=1;for(const tl of TEST_LEVELS)LEVELS.push(tl)}      // the override tests above truncate LEVELS to the first level: put the test levels back
+  const keep=Level.last,upd=AI.update;Level.load(5);fsm.go('READY');const e=Level.cur.enemies.find(q=>q.inn),f0=Config.fov0*D2R,XD=Ink.ix,XL=.29,XR=3.71,XW=-1.3;      // XW: solid wall left of window L (hut x ~500; the sprite is ~.5 m wide each side, the gap between openings is too narrow to hide him fully)
+  ok('TEST-5: interior soldier is a target, flagged inn, never in drawEnemy; route has 4 waypoints, waits 1-2 s, all inside the interior span (window L .. window R)',!!e&&e.target&&Level.cur.inn&&e.route.length===4&&e.route.every(w=>w.wait>=1&&w.wait<=2&&w.x>=XL-.01&&w.x<=XR+.01),e&&e.route.length);
+  let bad=0,vis=0,n=0,hid=0;const log=[];
+  for(const yw of[-.04,.0713,.23])for(const fv of[f0,f0/1.3])for(const[xs,ps]of[[XD,null],[XL,null],[XR,null],[XW,null],[1.0,.3],[1.6,.5],[2.4,.7],[3.2,.15],[XD,.5]]){const r=Ink.proof(yw,0,fv,xs,ps);n++;if(r[0])bad++;log.push(r[0]);if(xs===XW&&ps==null){if(r[1]===0)hid++}else if(xs===XD&&ps==null&&r[1]>0)vis++}
+  ok('occlusion: '+n+' renders (3 yaws x 2 zooms x 9 positions / walk frames): pixels OUTSIDE the openings are identical with and without him',bad===0,log.join(',').slice(0,60));
+  ok('occlusion: he is visible inside the door (6 camera states) and fully hidden behind solid wall (6 states)',vis===6&&hid===6,vis+'/'+hid);
+  {let o2=0;for(const t of[.3,.8,1.3,2.5])o2+=Ink.proof(.0713,0,f0,XD,null,t)[0];ok('occlusion: death animation (4 moments) stays inside the same mask',o2===0,o2)}
+  // hit rule: world point -> projects inside an opening or it is a wall hit
+  {look(.0713,0);const place=x=>{e.alive=true;e.ux=e.upx=x;AI.fr=0;Ink.glue()},seg=(py)=>{const c={x:e.x,y:e.y+py,z:e.z},k=1.05;return{px:EYE.x,py:EYE.y,pz:EYE.z,x:EYE.x+(c.x-EYE.x)*k,y:EYE.y+(c.y-EYE.y)*k,z:EYE.z+(c.z-EYE.z)*k,age:0}},hh=(x,py)=>{place(x);const q=collide(seg(py));return q?[q.kind,q.e===e?1:0,q.part]:null};
+   const d1=hh(XD,1.1),d2=hh(XD,1.62),w1=hh(XL,1.3),w2=hh(XL,1.1),w3=hh(XR,1.62),w4=hh(XR,.4),k1=hh(XW,1.1),k2=hh(XW,1.62);
+   ok('hit rule: in the doorway chest + head count (kind 1)',d1&&d1[0]===1&&d1[1]&&d2&&d2[0]===1&&d2[2]===1,JSON.stringify([d1,d2]));
+   ok('hit rule: in a window only the shoulder / upper-chest strip between sill and awning counts (1.3 m = kind 1); below the sill (1.1 m), the head under the awning (1.62 m) and the legs are a wall hit (kind 3, no enemy)',w1&&w1[0]===1&&w1[1]&&w2&&w2[0]===3&&!w2[1]&&w3&&w3[0]===3&&w4&&w4[0]===3,JSON.stringify([w1,w2,w3,w4]));
+   ok('hit rule: behind solid wall nothing counts (kind 3)',k1&&k1[0]===3&&k2&&k2[0]===3&&e.alive,JSON.stringify([k1,k2]))}
+  // patrol: 60 s of the real AI, sim metres
+  {AI.update=upd;Level.load(5);fsm.go('READY');const g=Level.cur.enemies.find(q=>q.inn);let mn=9,mx=-9,run=0,w=[];for(let i=0;i<60*120;i++){const px=g.ux;AI.update(Config.step);mn=min(mn,g.ux);mx=max(mx,g.ux);if(abs(g.ux-px)<1e-7)run+=Config.step;else{if(run>.8)w.push([+g.ux.toFixed(1),+run.toFixed(1)]);run=0}}
+   ok('patrol: 60 s back-and-forth stays inside the span (min/max '+mn.toFixed(2)+'/'+mx.toFixed(2)+'), reaches both windows, pauses seen: '+JSON.stringify(w.slice(0,6)),mn>=XL-.12&&mx<=XR+.12&&mn<XL+.15&&mx>XR-.15&&w.length>=4,mn+'/'+mx)}
+  // registration, guard feet, lifecycle (Phase 4)
+  {Level.load(4);const nx=nextLevel();Level.load(5);const g=Level.cur.enemies.find(q=>q.gl);let me=0;
+   ok('TEST-5 registered: LEVELS[5] plate ink + ink layers, NEXT chain 4 -> 5, picker button TEST-5, loads with 2 target enemies (guard + interior soldier)',LEVELS[5]&&LEVELS[5].plate==='ink'&&LEVELS[5].ink===1&&nx===5&&LvB.some(b=>b.t==='TEST-5'&&b.lv===5)&&Level.cur.ink===1&&Level.cur.enemies.filter(q=>q.target).length===2,nx);
+   for(const yw of[-.04,.0713,.23])for(const pt of[-.02,0,.15])for(const fv of[f0,f0/1.3]){look(yw,pt);Camera.fov=Camera.tfov=fv;updateCamR(1);Ink.glue();Ink.pt(g.x,g.y,g.z);me=max(me,hypot(Ink.u-Ink.gx,Ink.v-Ink.gy))}
+   ok('exterior guard feet stay on the deck spot (hut px) over 18 yaw / pitch / zoom states (max error px, hut px; 1 hut px = .38 stage px)',me<1.5,me);
+   const P0=Hut.P,C0=Hut.cv,n0=document.querySelectorAll('canvas').length;let okr=true;for(let i=0;i<4;i++){gotoLevel(5);const q=Level.cur.enemies.find(z=>z.inn);okr=okr&&q.alive&&q.ux===.29&&q.R===undefined&&q.ps===null&&q.wp===0&&Level.cur.inn===q;restart()}
+   ok('lifecycle: 4x level change / restart: soldier reset (alive, route start, no stale sprite state), Path2D / hut cache / canvas count unchanged (no leak)',okr&&Hut.P===P0&&Hut.cv===C0&&document.querySelectorAll('canvas').length===n0,n0)}
+  Level.load(keep<0?0:keep);fsm.go('READY')}
+ Config.sightTier=sv.st;Config.missPolicy=sv.mp;console.table(R)}
+
+// ===== BOOT =====
+{const t0=Date.now();buildDrop();console.log('drop table built in '+(Date.now()-t0)+' ms ('+Drop.pb.length+' pitches x '+Drop.n+' ranges)')}
+Loader.start();Rain.init();Level.load(0);fsm.go('READY');Loader.bypass=1;selfTest();Loader.bypass=0;for(const tl of TEST_LEVELS)LEVELS.push(tl);Level.load(0);fsm.go('READY');{const q=+new URLSearchParams(location.search).get('level');if(q>0)gotoLevel(q)}requestAnimationFrame(frame);
+</script></body></html>

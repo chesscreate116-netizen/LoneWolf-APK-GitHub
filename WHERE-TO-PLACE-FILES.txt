@@ -1,0 +1,42 @@
+LONEWOLF APK PROJECT - SIMPLE STRUCTURE
+
+Upload THIS ENTIRE folder to one GitHub repository.
+Do not move the files around.
+
+LoneWolf-APK-GitHub/
+|
+|-- package.json                 <- Capacitor packages
+|-- capacitor.config.json        <- Android app configuration
+|-- .gitignore
+|
+|-- www/                         <- YOUR ACTUAL GAME
+|   |-- index.html
+|   |-- lonewolf2-9-5.html
+|   `-- assets/
+|
+`-- .github/
+    `-- workflows/
+        `-- build-apk.yml        <- GitHub APK builder
+
+FILES REMOVED FROM ORIGINAL PROJECT BECAUSE APK DOES NOT NEED THEM:
+- tools/
+- HANDOFF_TEST2_CAMP.md
+- HANDOFF_TEST5.md
+- README.md
+
+HOW TO BUILD ON GITHUB:
+1. Create a new empty GitHub repository.
+2. Upload EVERYTHING inside this LoneWolf-APK-GitHub folder, including .github.
+3. Commit the files.
+4. Open the repository's Actions tab.
+5. Select "Build Android APK".
+6. Click "Run workflow" if it did not already run automatically.
+7. When the build finishes, open that workflow run.
+8. Under Artifacts, download "LoneWolf-debug-apk".
+9. Unzip it; app-debug.apk is your installable test APK.
+
+IMPORTANT:
+- This creates a DEBUG APK for phone testing.
+- appId is currently: com.lonewolf.arrowgame
+- appName is currently: LoneWolf Arrow
+- For a Play Store release later, use a signed release/AAB workflow instead.
